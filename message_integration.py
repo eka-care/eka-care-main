@@ -1,11 +1,13 @@
 import requests
 import json
 
+from constants import YELLOW_AI_API_KEY, JAPI_KEY, JAPI_AUTHORIZATION
+
 
 def send_wa_msg_yellow_ai(payload):
     url = "https://app.yellow.ai/api/engagements/notifications/v2/push?bot=x1653651115382"
     headers = {
-        "x-api-key": "dZTnwScEuyw33i0XPmXky2w8IYb0zfkbn-z-RCiJ",
+        "x-api-key": YELLOW_AI_API_KEY,
         "Content-Type": "application/json",
     }
     response = requests.request("POST", url, headers=headers, json=payload)
@@ -19,7 +21,7 @@ def send_msg_japi(mobile, text):
     mobile = f"91{mobile}"
     payload = {
         "ver": "1.0",
-        "key": "6HpAHyzAwpy0R9Ulic1Jnw==",
+        "key": JAPI_KEY,
         "messages": [
             {
                 "dest": [mobile],
@@ -30,7 +32,7 @@ def send_msg_japi(mobile, text):
     }
 
     headers = {
-        "Authorization": "bWV0cm9fYXBpOnZWdUFwRGtaMzV6QkRkcWJJcnNFMXc9PQ==",
+        "Authorization": JAPI_AUTHORIZATION,
         "Content-Type": "application/json",
     }
 
