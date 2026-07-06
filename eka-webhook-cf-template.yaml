@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'eka-webook-python-sdk-deployment'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "API GW Configuration"
+        Parameters:
+          - APIGWName
+          - StageName
+      - Label:
+          default: "Route53 Configuration"
+        Parameters:
+          - ExternalUrl
+          - HostedZoneID
+          - CertificateARN
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - DockerImage
+          - LambdaName
+          - SigningKey
+          - ClientID
+          - ClientSecret
+          - APIKey
+
+    ParameterLabels:
+      APIGWName:
+        default: "API Gateway Name"
+      StageName:
+        default: "Stage Name for the API Gateway to deploy to"
+      ExternalUrl:
+        default: "External URL of the webhook that will be used to invoke the Lambda Function"
+      HostedZoneID:
+        default: "Hosted Zone ID to add the External URL Entry"
+      DockerImage:
+        default: "Docker Image of the Lambda Function"
+      LambdaName:
+        default: "Lambda Function Name"
+      SigningKey:
+        default: "Signing Key for the Lambda Function"
+      ClientID:
+        default: "Client ID for the Lambda Function"
+      ClientSecret:
+        default: "Client Secret for the Lambda Function"
+      APIKey:
+        default: "API Key for the Lambda Function"
+      CertificateARN: 
+        default: "Certificate ARN for the custom domain"
+      
+Parameters:
+  APIGWName:
+    Type: String
+    Description: The name of the API Gateway to create
+    Default: eka-webhook-api-gateway
+
+  StageName:
+    Type: String
+    Description: The stage name for API Gateway deployment
+    Default: dev
+
+  ExternalUrl:
+    Type: String
+    Description: The external URL to forward requests to (without trailing slash)
+    Default: https://api.example.com
+
+  HostedZoneID:
+    Type: String
+    Description: The ID of the Route53 hosted zone for the external URL
+
+  DockerImage:
+    Type: String
+    Description: Docker image URI for the Lambda function
+    Default: 123456789012.dkr.ecr.us-east-1.amazonaws.com/eka-webhook-lambda:latest
+    
+  LambdaName:
+    Type: String
+    Description: The name of the Lambda function
+    Default: eka-webhook-lambda
+    
+  SigningKey:
+    Type: String
+    Description: Signing key for the Lambda function
+    NoEcho: true
+    
+  ClientID:
+    Type: String
+    Description: Client ID for the Lambda function
+    NoEcho: true
+    
+  ClientSecret:
+    Type: String
+    Description: Client secret for the Lambda function
+    NoEcho: true
+    
+  APIKey:
+    Type: String
+    Description: API key for the Lambda function
+    NoEcho: true
+    
+  CertificateARN:
+    Type: String
+    Description: The ARN of the ACM certificate for the custom domain
+    Default: arn:aws:acm:us-east-1:123456789012:certificate/abcd1234-5678-90ef-ghij-klmnopqrstuv
+
+  LambdaArchitecture:
+    Type: String
+    Description: The architecture for the Lambda function (arm64 or x86_64)
+    Default: x86_64
+    AllowedValues:
+      - arm64
+      - x86_64
+
+  VpcId:
+    Type: String
+    Description: The VPC ID for Lambda function
+    
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: The Subnet IDs for Lambda function (comma-delimited)
+    
+  SecurityGroupId:
+    Type: String
+    Description: The Security Group ID for Lambda function (optional)
+    Default: ""
+
+Resources:
+  # Create a Security Group if none provided
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateSecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda function in VPC
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-lambda-sg"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaName
+      Role: !GetAtt LambdaExecutionRole.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref DockerImage
+      Architectures:
+        - !Ref LambdaArchitecture
+      Timeout: 30
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !If [CreateSecurityGroup, !Ref LambdaSecurityGroup, !Ref SecurityGroupId]
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          EXTERNAL_URL: !Ref ExternalUrl
+          SIGNING_KEY: !Ref SigningKey
+          CLIENT_ID: !Ref ClientID
+          CLIENT_SECRET: !Ref ClientSecret
+          API_KEY: !Ref APIKey
+
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref APIGWName
+      Description: API Gateway for the Lambda function to make it accessible from eka-care
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !GetAtt APIGateway.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebhookLambda.Arn}/invocations
+
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref APIGateway
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: "{proxy+}"
+
+  ProxyResourceMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebhookLambda.Arn}/invocations
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+
+  APIGatewayDeployment: 
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProxyMethod
+      - ProxyResourceMethod
+    Properties:
+      RestApiId: !Ref APIGateway
+      StageName: !Ref StageName
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WebhookLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/*/*
+
+  CustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Select [2, !Split ["/", !Ref ExternalUrl]]
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      RegionalCertificateArn: !Ref CertificateARN
+  
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn:
+      - APIMapping
+      - CustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneID
+      Name: !Select [2, !Split ["/", !Ref ExternalUrl]]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt CustomDomain.RegionalHostedZoneId
+      
+
+  APIMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn:
+      - APIGatewayDeployment
+      - CustomDomain
+    Properties:
+      DomainName: !Select [2, !Split ["/", !Ref ExternalUrl]]
+      RestApiId: !Ref APIGateway
+      Stage: !Ref StageName  
+Outputs:
+  WebhookLambdaFunction:
+    Description: "Webhook Lambda Function ARN"
+    Value: !GetAtt WebhookLambda.Arn
+  APIGatewayURL:
+    Description: "API Gateway URL"
+    Value: !Sub https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  CustomDomainURL:
+    Description: "Custom Domain URL"
+    Value: !Sub https://${!Select [2, !Split ["/", !Ref ExternalUrl]]}
+  DNSRecord:
+    Description: "DNS Record for the custom domain"
+    Value: !Ref DNSRecord
+
+Conditions:
+  CreateSecurityGroup: !Equals [!Ref SecurityGroupId, ""]
