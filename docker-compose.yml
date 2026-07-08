@@ -11,7 +11,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile.standalone
+      dockerfile: Dockerfile
     image: ${APP_IMAGE:-eka-webhook:local}
     container_name: eka-webhook-app
     restart: unless-stopped

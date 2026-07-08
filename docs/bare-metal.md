@@ -48,7 +48,7 @@ missing/invalid values.
 ## `config-local.env`
 
 This is the single source of truth for configuration and secrets on the
-local/VM path (same role `config.env` plays for the AWS path). The
+local/VM path (same role `config-aws.env` plays for the AWS path). The
 installer sources it, prompts only for blank/placeholder values, and writes
 answers back into the file. Once populated it holds real secrets - the
 installer `chmod 600`s it, and it should never leave this host (it's

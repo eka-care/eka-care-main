@@ -3,7 +3,7 @@
 set -e
 
 # Default config file location
-CONFIG_FILE="config.env"
+CONFIG_FILE="config-aws.env"
 
 # Disable AWS CLI pager to prevent prompts
 export AWS_PAGER=""
@@ -18,8 +18,8 @@ usage() {
     echo "  delete                    Delete the CloudFormation stack"
     echo "  register-webhook          Register the webhook with Eka API (without deployment)"
     echo "  --version VERSION         Specify Docker image version"
-    echo "  --env-file PATH           Path to the env file (default: config.env, materialized"
-    echo "                            from config.env.example if missing)"
+    echo "  --env-file PATH           Path to the env file (default: config-aws.env, materialized"
+    echo "                            from config-aws.env.example if missing)"
     echo "  -h, --help                Display this help message"
     echo ""
 }
@@ -109,7 +109,7 @@ source "$CONFIG_FILE"
 echo "Verifying deployment files..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MISSING_FILES=0
-for REQUIRED_FILE in "$TEMPLATE_FILE" "$SCRIPT_DIR/lib/register-webhook.sh"; do
+for REQUIRED_FILE in "$TEMPLATE_FILE" "$SCRIPT_DIR/Dockerfile-aws" "$SCRIPT_DIR/lib/register-webhook.sh"; do
     if [ -f "$REQUIRED_FILE" ]; then
         echo "  OK       $REQUIRED_FILE"
     else
@@ -194,7 +194,7 @@ setup_ecr_and_deploy_image() {
     
     # Build the Docker image from local code
     echo "Building Docker image with version tag $DOCKER_IMAGE_VERSION..."
-    docker build -t ekapython-webhook-sdk:$DOCKER_IMAGE_VERSION . || {
+    docker build -f Dockerfile-aws -t ekapython-webhook-sdk:$DOCKER_IMAGE_VERSION . || {
         echo "Error: Failed to build Docker image. Exiting."
         # Clean up ECR repository if we created it in this run
         if $ECR_REPO_CREATED; then
@@ -472,7 +472,7 @@ upgrade_lambda() {
     
     # Validate Docker image version is provided
     if [ -z "$DOCKER_IMAGE_VERSION" ]; then
-        echo "Error: DOCKER_IMAGE_VERSION must be specified via --version parameter or in config.env"
+        echo "Error: DOCKER_IMAGE_VERSION must be specified via --version parameter or in config-aws.env"
         exit 1
     fi
     
@@ -481,7 +481,7 @@ upgrade_lambda() {
     # Set up ECR and deploy the new image
     setup_ecr_and_deploy_image
     
-    # Generate parameters file from config.env, just like in deploy_stack
+    # Generate parameters file from config-aws.env, just like in deploy_stack
     generate_parameters
     
     # Update the CloudFormation stack with the new parameters
@@ -530,7 +530,7 @@ case $ACTION in
         # Only register the webhook with Eka API
         echo "Registering webhook only..."
         if [ -z "$EXTERNAL_URL" ]; then
-            echo "Error: EXTERNAL_URL must be set in config.env"
+            echo "Error: EXTERNAL_URL must be set in config-aws.env"
             exit 1
         fi
         register_webhook

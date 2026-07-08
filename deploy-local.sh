@@ -609,7 +609,7 @@ verify_setup() {
     local missing=0 f
     local required_files=(
         "$SCRIPT_DIR/docker-compose.yml"
-        "$SCRIPT_DIR/Dockerfile.standalone"
+        "$SCRIPT_DIR/Dockerfile"
         "$SCRIPT_DIR/nginx/nginx.conf.example"
         "$SCRIPT_DIR/nginx/nginx-https.conf.example"
     )

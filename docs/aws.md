@@ -33,13 +33,13 @@ For bare metal / a VM / local instead, see [bare-metal.md](./bare-metal.md).
 
 3. **Configure environment variables**
 
-   `config.env` isn't tracked in git - `deploy-aws.sh` creates it from
-   `config.env.example` the first time you run it, then exits so you can
+   `config-aws.env` isn't tracked in git - `deploy-aws.sh` creates it from
+   `config-aws.env.example` the first time you run it, then exits so you can
    fill in real values (see the [parameter reference](#configuration-parameters)
    below):
    ```bash
-   ./deploy-aws.sh deploy --version <version-tag>   # creates config.env, exits
-   vim config.env                               # fill in real values
+   ./deploy-aws.sh deploy --version <version-tag>   # creates config-aws.env, exits
+   vim config-aws.env                               # fill in real values
    ```
 
 4. **Make the deployment script executable**
@@ -60,7 +60,7 @@ For bare metal / a VM / local instead, see [bare-metal.md](./bare-metal.md).
 
 ## Configuration parameters
 
-`config.env` fields, all consumed by `deploy-aws.sh` and passed to the CloudFormation template:
+`config-aws.env` fields, all consumed by `deploy-aws.sh` and passed to the CloudFormation template:
 
 ### Stack configuration
 - **STACK_NAME**: CloudFormation stack name
