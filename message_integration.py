@@ -1,42 +1,19 @@
-import requests
-import json
+import importlib
 
-from constants import YELLOW_AI_API_KEY, JAPI_KEY, JAPI_AUTHORIZATION
-
-
-def send_wa_msg_yellow_ai(payload):
-    url = "https://app.yellow.ai/api/engagements/notifications/v2/push?bot=x1653651115382"
-    headers = {
-        "x-api-key": YELLOW_AI_API_KEY,
-        "Content-Type": "application/json",
-    }
-    response = requests.request("POST", url, headers=headers, json=payload)
-    response_data = response.json()
-    print(response_data)
-    return response_data
+from config_loader import load_client_config
 
 
-def send_msg_japi(mobile, text):
-    url = "https://japi.instaalerts.zone/httpapi/JsonReceiver"
-    mobile = f"91{mobile}"
-    payload = {
-        "ver": "1.0",
-        "key": JAPI_KEY,
-        "messages": [
-            {
-                "dest": [mobile],
-                "text": text,
-                "send": "METLAB",
-            }
-        ],
-    }
+def _get_integration_module(client_name=None):
+    client_config = load_client_config(client_name)
+    package_name = (client_config.get("integration_package") or "metropolis").lower()
+    return importlib.import_module(package_name)
 
-    headers = {
-        "Authorization": JAPI_AUTHORIZATION,
-        "Content-Type": "application/json",
-    }
 
-    response = requests.request("POST", url, headers=headers, json=payload)
-    response_data = response.json()
-    print(response_data)
-    return response_data
+def send_wa_msg_yellow_ai(payload, client_name=None):
+    integration_module = _get_integration_module(client_name)
+    return integration_module.send_wa_msg(payload)
+
+
+def send_msg_japi(mobile, text, client_name=None):
+    integration_module = _get_integration_module(client_name)
+    return integration_module.send_sms(mobile, text)

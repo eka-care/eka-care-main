@@ -1,0 +1,89 @@
+default_client: metropolis
+
+clients:
+  metropolis:
+    integration_package: metropolis
+    contact_no: "8422-801-801"
+    tele_url_base: "https://consultation.metropolisindia.com"
+    event_triggers:
+      - appointment.created
+      - appointment.updated
+      - prescription.created
+      - prescription.updated
+      - appointment.tele.dr_joined
+    templates:
+      appointment.created:
+        whatsapp:
+          - eka_wa_new_appointment_dr_message
+          - eka_wa_appointment_confirmation
+        sms:
+          - SMS_INCLINIC_MSG
+      prescription.created:
+        whatsapp:
+          - eka_prescription
+        sms: []
+      prescription.updated:
+        whatsapp:
+          - eka_prescription
+        sms: []
+      appointment.tele.dr_joined:
+        whatsapp:
+          - consultation_started1_copy
+        sms: []
+    channels:
+      whatsapp:
+        enabled: true
+        provider: yellow_ai
+        sender: "918422801801"
+        namespace: "8b0dac33_a4d2_4e1b_a199_65417d3a394c"
+        recipient_map:
+          eka_wa_new_appointment_dr_message: doctor
+          eka_wa_appointment_confirmation: patient
+          eka_prescription: patient
+          consultation_started1_copy: patient
+      sms:
+        enabled: true
+        provider: japi
+        sender: "METLAB"
+        recipient_map:
+          SMS_INCLINIC_MSG: patient
+
+  miracles:
+    integration_package: miracles
+    contact_no: "8422-801-801"
+    tele_url_base: "https://consultation.miraclesindia.com"
+    event_triggers:
+      - prescription.created
+      - appointment.tele.dr_joined
+    templates:
+      appointment.created:
+        whatsapp:
+          - eka_wa_new_appointment_dr_message
+          - eka_wa_appointment_confirmation
+        sms:
+          - SMS_INCLINIC_MSG
+      prescription.created:
+        whatsapp:
+          - eka_prescription
+        sms: []
+      appointment.tele.dr_joined:
+        whatsapp:
+          - consultation_started1_copy
+        sms: []
+    channels:
+      whatsapp:
+        enabled: true
+        provider: yellow_ai
+        sender: "918422801801"
+        namespace: "8b0dac33_a4d2_4e1b_a199_65417d3a394c"
+        recipient_map:
+          eka_wa_new_appointment_dr_message: doctor
+          eka_wa_appointment_confirmation: patient
+          eka_prescription: patient
+          consultation_started1_copy: patient
+      sms:
+        enabled: true
+        provider: japi
+        sender: "METLAB"
+        recipient_map:
+          SMS_INCLINIC_MSG: patient
