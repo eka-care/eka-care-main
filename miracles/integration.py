@@ -1,3 +1,5 @@
+import os
+
 import requests
 
 from constants import JAPI_AUTHORIZATION, JAPI_KEY, YELLOW_AI_API_KEY
@@ -85,7 +87,7 @@ def send_wa_msg(payload):
     url = "https://rcmapi.instaalerts.zone/services/rcm/sendMessage"
     headers = {
         "Content-Type": "application/json",
-        "Authentication": "Wyv7huD0i0gSMcnm33gurA==",
+        "Authentication": os.getenv("RCMAPI_API_KEY") # "Wyv7huD0i0gSMcnm33gurA==",
     }
     response = requests.request("POST", url, headers=headers, json=wa_payload)
     response_data = response.json()
