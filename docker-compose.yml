@@ -1,0 +1,85 @@
+# Single compose file for the bare metal/VM/local path. deploy-local.sh
+# decides what actually runs:
+#   - app always runs.
+#   - nginx/certbot only run when deploy-local.sh passes `--profile ssl`
+#     (i.e. SSL_MODE=managed in config-local.env).
+#   - APP_BIND_ADDR is set by deploy-local.sh: 0.0.0.0 when there's no proxy
+#     in front (SSL_MODE=external), 127.0.0.1 when nginx is fronting it
+#     (SSL_MODE=managed) so the app is never reachable except through nginx.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+    image: ${APP_IMAGE:-eka-webhook:local}
+    container_name: eka-webhook-app
+    restart: unless-stopped
+    env_file:
+      - config-local.env
+    ports:
+      - "${APP_BIND_ADDR:-0.0.0.0}:${PORT:-8080}:${PORT:-8080}"
+    networks:
+      - eka-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Only started when the "ssl" profile is active (SSL_MODE=managed).
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: eka-webhook-nginx
+    profiles: ["ssl"]
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
+      - "${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
+    volumes:
+      # Overwrites the image's own conf.d/default.conf so there's exactly one
+      # server block handling port 80/443 - no ambiguity with nginx's stock
+      # welcome-page config if a request's Host header doesn't match ours.
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl-enabled:/etc/nginx/ssl-enabled:ro
+      - certbot_webroot:/var/www/certbot:ro
+      - certbot_certs:/etc/letsencrypt:ro
+    networks:
+      - eka-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Long-running renewal loop. Initial issuance is a one-off `docker compose
+  # --profile ssl run --rm certbot certonly ...` invoked by deploy-local.sh
+  # during the SSL bootstrap step, after nginx is already serving the ACME
+  # HTTP-01 challenge on port 80.
+  certbot:
+    image: certbot/certbot:latest
+    container_name: eka-webhook-certbot
+    profiles: ["ssl"]
+    restart: unless-stopped
+    volumes:
+      - certbot_webroot:/var/www/certbot
+      - certbot_certs:/etc/letsencrypt
+    networks:
+      - eka-net
+    entrypoint: >
+      sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  certbot_webroot:
+  certbot_certs:
+
+networks:
+  eka-net:
+    external: true

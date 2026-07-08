@@ -10,7 +10,7 @@ export AWS_PAGER=""
 
 # Function to display usage
 usage() {
-    echo "Usage: $0 [deploy|upgrade|delete|register-webhook] [--version VERSION]"
+    echo "Usage: $0 [deploy|upgrade|delete|register-webhook] [--version VERSION] [--env-file PATH]"
     echo "Deploy, upgrade, delete CloudFormation stack, or register webhook for the Eka webhook"
     echo ""
     echo "  deploy                    Deploy the CloudFormation stack (default)"
@@ -18,6 +18,8 @@ usage() {
     echo "  delete                    Delete the CloudFormation stack"
     echo "  register-webhook          Register the webhook with Eka API (without deployment)"
     echo "  --version VERSION         Specify Docker image version"
+    echo "  --env-file PATH           Path to the env file (default: config.env, materialized"
+    echo "                            from config.env.example if missing)"
     echo "  -h, --help                Display this help message"
     echo ""
 }
@@ -64,6 +66,15 @@ while [[ $# -gt 0 ]]; do
             echo "Using Docker image version from command line: $CMD_DOCKER_IMAGE_VERSION"
             shift 2
             ;;
+        --env-file)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: --env-file requires a value"
+                usage
+                exit 1
+            fi
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -76,25 +87,41 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Load environment variables from config file
-if [ -f "$CONFIG_FILE" ]; then
-    echo "Loading configuration from $CONFIG_FILE..."
-    source "$CONFIG_FILE"
-else
-    echo "Error: Config file '$CONFIG_FILE' not found!"
-    echo "Please create a config.env file with the required configuration parameters."
-    echo "Example:"
-    echo "STACK_NAME=eka-webhook-stack"
-    echo "TEMPLATE_FILE=eka-webhook-cf-template.yaml"
-    echo "REGION=ap-south-1"
-    echo "STAGE_NAME=prod"
-    echo "EXTERNAL_URL=https://eka-webhook.example.com"
-    echo "CERTIFICATE_ARN=arn:aws:acm:ap-south-1:123456789012:certificate/abcd1234-5678-90ef-ghij-klmnopqrstuv"
-    echo "VPC_ID=vpc-12345678"
-    echo "SUBNET_IDS=subnet-12345678,subnet-87654321"
-    echo "SECURITY_GROUP_ID=sg-12345678 # Optional - will be created if not specified"
+# Load environment variables from config file, materializing it from the
+# tracked example template on first run.
+if [ ! -f "$CONFIG_FILE" ]; then
+    if [ -f "${CONFIG_FILE}.example" ]; then
+        cp "${CONFIG_FILE}.example" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        echo "Created $CONFIG_FILE from ${CONFIG_FILE}.example - edit it with your real values, then re-run this command."
+        exit 1
+    else
+        echo "Error: Config file '$CONFIG_FILE' not found and no ${CONFIG_FILE}.example to create it from!"
+        exit 1
+    fi
+fi
+
+echo "Loading configuration from $CONFIG_FILE..."
+source "$CONFIG_FILE"
+
+# Verify the files this script depends on are present before doing anything
+# else - fails fast with a clear message instead of partway through a deploy.
+echo "Verifying deployment files..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MISSING_FILES=0
+for REQUIRED_FILE in "$TEMPLATE_FILE" "$SCRIPT_DIR/lib/register-webhook.sh"; do
+    if [ -f "$REQUIRED_FILE" ]; then
+        echo "  OK       $REQUIRED_FILE"
+    else
+        echo "  MISSING  $REQUIRED_FILE"
+        MISSING_FILES=1
+    fi
+done
+if [ "$MISSING_FILES" -eq 1 ]; then
+    echo "Error: this checkout is missing files this script depends on - re-clone/restore the repo before continuing." >&2
     exit 1
 fi
+source "$SCRIPT_DIR/lib/register-webhook.sh"
 
 # Use command line version if provided, otherwise use config file version
 if [[ -n "$CMD_DOCKER_IMAGE_VERSION" ]]; then
@@ -344,12 +371,6 @@ EOF
     echo "Parameters file generated successfully at $PARAMS_FILE"
 }
 
-# Check if template file exists
-if [ ! -f "$TEMPLATE_FILE" ]; then
-    echo "Error: Template file '$TEMPLATE_FILE' not found!"
-    exit 1
-fi
-
 # Function to deploy stack - will now run after ECR operations
 deploy_stack() {
     # Generate parameters from environment variables
@@ -487,70 +508,6 @@ upgrade_lambda() {
     
     echo "Lambda function upgraded successfully with Docker image version $DOCKER_IMAGE_VERSION."
     get_stack_outputs
-}
-
-register_webhook(){
-    # Register the webhook with the specified URL
-    echo "Getting Auth Token"
-
-    # Check if required variables are set
-    if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$API_KEY" ]; then
-        echo "Error: CLIENT_ID, CLIENT_SECRET, and API_KEY must be set in config.env"
-        return 1
-    fi
-
-    if [ -z "$SIGNING_KEY" ]; then
-        echo "Error: SIGNING_KEY must be set in config.env"
-        return 1
-    fi
-
-    AUTH_TOKEN=$(curl --request POST \
-        --url 'https://api.eka.care/connect-auth/v1/account/login' \
-        --header 'Content-Type: application/json' \
-        --data "{
-        \"client_id\": \"${CLIENT_ID}\",
-        \"client_secret\": \"${CLIENT_SECRET}\",
-        \"api_key\": \"${API_KEY}\"
-        }" | jq -r '.access_token')
-
-    if [ -z "$AUTH_TOKEN" ] || [ "$AUTH_TOKEN" == "null" ]; then
-        echo "Error: Failed to obtain auth token. Check your CLIENT_ID, CLIENT_SECRET, and API_KEY."
-        return 1
-    fi
-
-    echo "Registering webhook with URL: $EXTERNAL_URL"
-
-    # Store HTTP status code and response body separately
-    HTTP_STATUS=$(curl --silent --output response.txt --write-out "%{http_code}" \
-        --request POST \
-        --url https://api.eka.care/notification/v1/connect/webhook/subscriptions \
-        --header "Authorization: Bearer ${AUTH_TOKEN}" \
-        --header 'Content-Type: application/json' \
-        --data "{
-        \"event_names\": [
-            \"appointment.created\",
-            \"appointment.updated\",
-            \"prescription.created\",
-            \"prescription.updated\"
-        ],
-        \"endpoint\": \"${EXTERNAL_URL}\",
-        \"signing_key\": \"${SIGNING_KEY}\",
-        \"protocol\": \"https\"
-        }")
-    
-    RESPONSE_BODY=$(cat response.txt)
-    rm -f response.txt  # Clean up temporary file
-    
-    # Check the HTTP status code
-    if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then
-        echo "Webhook registered successfully! (HTTP $HTTP_STATUS)"
-        echo "Response: $RESPONSE_BODY"
-        return 0
-    else
-        echo "Failed to register webhook. HTTP Status: $HTTP_STATUS"
-        echo "Response: $RESPONSE_BODY"
-        return 1
-    fi
 }
 
 # Execute the specified action based on the ACTION variable

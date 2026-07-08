@@ -1,0 +1,30 @@
+# This is a conf.d fragment (not the container's top-level nginx.conf) -
+# deploy-local.sh renders it (envsubst) into ./nginx/nginx.conf, mounted
+# read-only into the nginx container, overwriting the image's own
+# conf.d/default.conf so there's no ambiguity with nginx's stock
+# welcome-page config on requests whose Host header doesn't match ours.
+#
+# Always serves the ACME HTTP-01 challenge + proxies to the app on
+# ${HTTP_PORT}. The HTTPS server block is added separately once a
+# certificate exists - see nginx-https.conf.example - via the glob include
+# below, which is a no-op while ./nginx/ssl-enabled/ is empty (no cert
+# issued yet).
+
+server {
+    listen ${HTTP_PORT} default_server;
+    server_name ${EXTERNAL_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        proxy_pass http://app:${PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+include /etc/nginx/ssl-enabled/*.conf;
