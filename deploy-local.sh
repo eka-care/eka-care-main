@@ -173,13 +173,22 @@ ask() {
 
 # ---- network / connectivity helpers ---------------------------------------
 
+# Sets LAST_TCP_ERROR to bash's own /dev/tcp error text (e.g. "Name or
+# service not known" for a DNS failure, "Connection refused", "Connection
+# timed out") so callers can report exactly why an endpoint was unreachable,
+# not just that it was.
 check_tcp() {
     local host="$1" port="$2"
+    LAST_TCP_ERROR=""
+    local err status
     if command -v timeout >/dev/null 2>&1; then
-        timeout 5 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+        err=$(timeout 5 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>&1 >/dev/null)
     else
-        bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+        err=$(bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>&1 >/dev/null)
     fi
+    status=$?
+    LAST_TCP_ERROR=$(echo "$err" | sed -E 's/^bash: (line [0-9]+: )?//' | paste -sd '; ' -)
+    return $status
 }
 
 # Retries a single endpoint with backoff before giving up - client firewalls
@@ -195,10 +204,10 @@ check_connectivity() {
             return 0
         fi
         if [ "$attempt" -ge "$max" ]; then
-            log "  FAIL  $label ($host:$port) - unreachable after $max attempts"
+            log "  FAIL  $label ($host:$port) - unreachable after $max attempts${LAST_TCP_ERROR:+: $LAST_TCP_ERROR}"
             return 1
         fi
-        log "  ...   $label ($host:$port) unreachable, retrying in ${delay}s (attempt $((attempt + 1))/$max)"
+        log "  ...   $label ($host:$port) unreachable${LAST_TCP_ERROR:+ ($LAST_TCP_ERROR)}, retrying in ${delay}s (attempt $((attempt + 1))/$max)"
         sleep "$delay"
         attempt=$((attempt + 1))
         delay=$((delay * 2))
@@ -284,7 +293,7 @@ step_preflight() {
 
     local registry_host
     registry_host=$(parse_registry_host "${CLI_IMAGE:-registry-1.docker.io/library/python}")
-    check_connectivity "$registry_host" 443 "Docker registry" || conn_failed=1
+    check_connectivity "$registry_host" 443 "Docker registry (app image)" || conn_failed=1
 
     if ! $SKIP_DOCKER_INSTALL && ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1); then
         check_connectivity "get.docker.com" 443 "Docker install script" || conn_failed=1
@@ -292,7 +301,18 @@ step_preflight() {
 
     local known_ssl_mode="${CLI_SSL_MODE:-$SSL_MODE}"
     if [ "$known_ssl_mode" == "managed" ]; then
+        # nginx/certbot images are always pulled from Docker Hub, regardless
+        # of --image pointing the app at a different (private) registry.
+        if [ "$registry_host" != "registry-1.docker.io" ]; then
+            check_connectivity "registry-1.docker.io" 443 "Docker Hub (nginx/certbot images)" || conn_failed=1
+        fi
         check_connectivity "acme-v02.api.letsencrypt.org" 443 "Let's Encrypt" || conn_failed=1
+        # Advisory only - only used for the best-effort DNS sanity warning
+        # later, so its unreachability never blocks the install.
+        if command -v dig >/dev/null 2>&1; then
+            check_connectivity "checkip.amazonaws.com" 443 "Public IP lookup (DNS sanity check)" ||
+                log "  (non-fatal) DNS sanity check will be skipped without this."
+        fi
     fi
 
     if [ "$conn_failed" -eq 1 ]; then
@@ -302,6 +322,62 @@ step_preflight() {
     fi
 
     state_mark_done "preflight"
+}
+
+detect_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then echo "apt-get"
+    elif command -v dnf >/dev/null 2>&1; then echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then echo "yum"
+    elif command -v zypper >/dev/null 2>&1; then echo "zypper"
+    fi
+}
+
+# Rootless Docker's own installer (get.docker.com/rootless) needs iptables and
+# newuidmap/newgidmap on the host and just dies with its own error message if
+# they're missing. Detect and offer to install them first so that failure
+# doesn't happen mid-install.
+ensure_rootless_prereqs() {
+    local missing_bins=()
+    command -v iptables >/dev/null 2>&1 || missing_bins+=("iptables")
+    command -v newuidmap >/dev/null 2>&1 || missing_bins+=("newuidmap")
+    [ "${#missing_bins[@]}" -eq 0 ] && return 0
+
+    local mgr
+    mgr=$(detect_pkg_manager)
+    if [ -z "$mgr" ]; then
+        log "Warning: missing ${missing_bins[*]} and no known package manager (apt-get/dnf/yum/zypper) detected."
+        log "Install these manually before continuing if the rootless Docker install below fails."
+        return 0
+    fi
+
+    local pkgs=()
+    for bin in "${missing_bins[@]}"; do
+        case "$bin:$mgr" in
+            iptables:*) pkgs+=("iptables") ;;
+            newuidmap:apt-get) pkgs+=("uidmap") ;;
+            newuidmap:dnf|newuidmap:yum) pkgs+=("shadow-utils") ;;
+            newuidmap:zypper) pkgs+=("shadow") ;;
+        esac
+    done
+
+    local install_cmd
+    case "$mgr" in
+        apt-get) install_cmd="sudo apt-get update && sudo apt-get install -y ${pkgs[*]}" ;;
+        dnf)     install_cmd="sudo dnf install -y ${pkgs[*]}" ;;
+        yum)     install_cmd="sudo yum install -y ${pkgs[*]}" ;;
+        zypper)  install_cmd="sudo zypper install -y ${pkgs[*]}" ;;
+    esac
+
+    log "Rootless Docker needs: ${missing_bins[*]} (missing). Package(s) to install via $mgr: ${pkgs[*]}"
+    if ! $NONINTERACTIVE; then
+        read -r -p "Install rootless Docker prerequisites (${pkgs[*]}) via sudo $mgr now? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker cannot install without ${missing_bins[*]}."; exit 1; }
+    fi
+    if $DRY_RUN; then
+        echo "[dry-run] would run: $install_cmd"
+    else
+        eval "$install_cmd"
+    fi
 }
 
 step_docker_install() {
@@ -322,6 +398,8 @@ step_docker_install() {
             read -r -p "Docker/compose not found. Install rootless Docker now? [y/N]: " CONFIRM
             [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: Docker is required (or re-run with --skip-docker-install once installed)."; exit 1; }
         fi
+        ensure_rootless_prereqs
+
         if $DRY_RUN; then
             echo "[dry-run] would run: curl -fsSL https://get.docker.com/rootless | sh"
             echo "[dry-run] would run: systemctl --user enable --now docker"

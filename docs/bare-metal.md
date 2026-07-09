@@ -11,17 +11,26 @@ box for testing. For AWS (Lambda + API Gateway via CloudFormation), see
 - A Linux host (bare metal or VM). macOS/Windows are not supported by this
   script.
 - Outbound HTTPS (443) access to: `www.eka.care`, `api.eka.care` (webhook
-  auth/registration), a Docker registry (Docker Hub by default, or your own
-  private registry if using `--image`), `get.docker.com` (unless Docker is
-  already installed or you pass `--skip-docker-install`), and - if you want
-  managed SSL - Let's Encrypt. The installer checks every one of these
-  during preflight, retrying with backoff before failing (client firewalls
-  commonly block one or more of them), and reports every blocked endpoint
-  together rather than stopping at the first.
+  auth/registration), the app image's Docker registry (Docker Hub by default,
+  or your own private registry if using `--image`), `get.docker.com` (unless
+  Docker is already installed or you pass `--skip-docker-install`), and - if
+  you want managed SSL - Docker Hub as well (nginx/certbot images always come
+  from there, even if `--image` points the app at a private registry), Let's
+  Encrypt, and (best-effort, non-blocking) `checkip.amazonaws.com` for the DNS
+  sanity check. The installer checks every required one of these during
+  preflight, retrying with backoff before failing (client firewalls commonly
+  block one or more of them), reports every blocked endpoint together rather
+  than stopping at the first, and prints the exact reason (DNS failure,
+  connection refused, timeout, ...) for each one that's unreachable.
 - `curl`, `jq`, `openssl` (the installer checks for these and tells you if
   one is missing).
-- Root/sudo access is only needed once, and only if you choose managed SSL
-  on a rootless Docker setup that needs to bind ports 80/443 (see below).
+- Root/sudo access may be needed, but only briefly and only for two things:
+  installing Docker's own rootless-mode prerequisites (`iptables`,
+  `uidmap`/`shadow-utils`/`shadow`, depending on your package manager) if
+  they're not already on the box - the installer detects what's missing via
+  `apt-get`/`dnf`/`yum`/`zypper` and asks before running anything - and, if
+  you choose managed SSL on a rootless Docker setup, binding ports 80/443
+  (see below).
 - If you already manage Docker yourself (Ansible, Chef, golden image, ...),
   pass `--skip-docker-install` and the script will just verify it's present.
 
