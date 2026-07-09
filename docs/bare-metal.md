@@ -154,6 +154,12 @@ Useful flags on `install`/`upgrade`: `--fresh` (ignore saved step state),
 with everything pre-filled in `config.env`), `--port`,
 `--external-url`, `--ssl-mode managed|external`, `--skip-docker-install`.
 
+Every `[y/N]` confirmation during install (installing missing packages,
+loading kernel modules, sudo steps, etc.) also accepts `a`/`A` - "yes to
+all", same convention as many Linux package managers - which answers yes to
+that prompt and every remaining confirmation for the rest of the run, so you
+don't need to type `y` a dozen separate times on a fresh host.
+
 ## State and logs
 
 - Step-completion state: `~/.eka-deploy/state.json` (`chmod 600`, no secrets

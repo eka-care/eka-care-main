@@ -69,6 +69,28 @@ EOF
 log() { echo "[eka-deploy] $*"; }
 debug() { $DEBUG && echo "[debug] $*" >&2; true; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' is required but not installed." >&2; exit 1; }; }
+
+# Set true once the user answers "a"/"A" ("yes to all") at any confirm()
+# prompt - every confirm() call for the rest of this run is then answered
+# yes automatically, same "a" convention many Linux installers use, so a
+# multi-step install doesn't need "y" typed a dozen separate times.
+CONFIRM_ALL=false
+
+# Prompts a y/N/a confirmation. Returns 0 (confirmed) or 1 (declined) -
+# never actually prompts once CONFIRM_ALL is set. Callers are still
+# responsible for checking $NONINTERACTIVE themselves before calling this
+# (matches every existing call site's structure).
+confirm() {
+    local prompt="$1"
+    $CONFIRM_ALL && return 0
+    local answer
+    read -r -p "$prompt [y/N/a]: " answer
+    case "$answer" in
+        [Aa]) CONFIRM_ALL=true; return 0 ;;
+        [Yy]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 # Random hex string straight from the kernel's CSPRNG - no openssl (or any
 # other external binary) needed just to generate a signing key.
 random_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
@@ -129,8 +151,7 @@ ensure_installed() {
 
     log "$purpose needs: ${missing_bins[*]} (missing). Package(s) to install via $mgr: ${pkgs[*]}"
     if ! $NONINTERACTIVE; then
-        read -r -p "Install missing prerequisites (${pkgs[*]}) via sudo $mgr now? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: $purpose requires ${missing_bins[*]}."; exit 1; }
+        confirm "Install missing prerequisites (${pkgs[*]}) via sudo $mgr now?" || { echo "Aborting: $purpose requires ${missing_bins[*]}."; exit 1; }
     fi
     if $DRY_RUN; then
         echo "[dry-run] would run: $install_cmd"
@@ -157,8 +178,7 @@ ensure_kernel_modules() {
 
     log "Kernel module(s) not loaded (required for rootless Docker's iptables/nftables setup): ${missing[*]}"
     if ! $NONINTERACTIVE; then
-        read -r -p "Load ${missing[*]} now via sudo modprobe? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker requires: ${missing[*]}."; exit 1; }
+        confirm "Load ${missing[*]} now via sudo modprobe?" || { echo "Aborting: rootless Docker requires: ${missing[*]}."; exit 1; }
     fi
     if $DRY_RUN; then
         echo "[dry-run] would run: sudo modprobe ${missing[*]}"
@@ -181,8 +201,7 @@ ensure_clean_rootless_install() {
 
     log "Found a leftover rootless Docker binary at $dockerd_bin from a previous incomplete install."
     if ! $NONINTERACTIVE; then
-        read -r -p "Remove it and retry installation? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: remove $dockerd_bin manually (after 'systemctl --user stop docker') and re-run, or pass --skip-docker-install if Docker is already usable."; exit 1; }
+        confirm "Remove it and retry installation?" || { echo "Aborting: remove $dockerd_bin manually (after 'systemctl --user stop docker') and re-run, or pass --skip-docker-install if Docker is already usable."; exit 1; }
     fi
     if $DRY_RUN; then
         echo "[dry-run] would run: systemctl --user stop docker (best-effort)"
@@ -216,8 +235,7 @@ ensure_apparmor_userns_allowed() {
 
     log "AppArmor is restricting unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1) - rootless Docker's rootlesskit needs an exemption, or it fails with 'permission denied'."
     if ! $NONINTERACTIVE; then
-        read -r -p "Install an AppArmor profile allowing rootlesskit ($rootlesskit_bin) unconfined userns access, via sudo? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker cannot start without this. See https://rootlesscontaine.rs/getting-started/common/"; exit 1; }
+        confirm "Install an AppArmor profile allowing rootlesskit ($rootlesskit_bin) unconfined userns access, via sudo?" || { echo "Aborting: rootless Docker cannot start without this. See https://rootlesscontaine.rs/getting-started/common/"; exit 1; }
     fi
 
     if $DRY_RUN; then
@@ -243,35 +261,77 @@ EOF
 # itself was just freshly installed or was already present on the box.
 # No-ops with zero prompts if it's already working.
 ensure_compose_plugin() {
-    docker compose version >/dev/null 2>&1 && return 0
+    if ! docker compose version >/dev/null 2>&1; then
+        log "Docker Compose CLI plugin not found ('docker compose' is unrecognized)."
+        if ! $NONINTERACTIVE; then
+            confirm "Download and install it now (to ~/.docker/cli-plugins/docker-compose)?" || { echo "Aborting: the Docker Compose plugin is required."; exit 1; }
+        fi
 
-    log "Docker Compose CLI plugin not found ('docker compose' is unrecognized)."
-    if ! $NONINTERACTIVE; then
-        read -r -p "Download and install it now (to ~/.docker/cli-plugins/docker-compose)? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: the Docker Compose plugin is required."; exit 1; }
+        local arch compose_url
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64)  compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" ;;
+            aarch64) compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-aarch64" ;;
+            *) echo "Error: no known Docker Compose plugin build for architecture '$arch'. Install it manually: https://docs.docker.com/compose/install/linux/#install-the-plugin-manually" >&2; exit 1 ;;
+        esac
+
+        if $DRY_RUN; then
+            echo "[dry-run] would run: mkdir -p ~/.docker/cli-plugins && curl -fsSL $compose_url -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose"
+        else
+            mkdir -p "$HOME/.docker/cli-plugins"
+            curl -fsSL "$compose_url" -o "$HOME/.docker/cli-plugins/docker-compose" || {
+                echo "Error: failed to download the Docker Compose plugin from $compose_url" >&2
+                exit 1
+            }
+            chmod +x "$HOME/.docker/cli-plugins/docker-compose"
+            docker compose version >/dev/null 2>&1 || {
+                echo "Error: Docker Compose plugin installed but 'docker compose version' still fails." >&2
+                exit 1
+            }
+        fi
     fi
 
-    local arch compose_url
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)  compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" ;;
-        aarch64) compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-aarch64" ;;
-        *) echo "Error: no known Docker Compose plugin build for architecture '$arch'. Install it manually: https://docs.docker.com/compose/install/linux/#install-the-plugin-manually" >&2; exit 1 ;;
-    esac
+    # Some tooling/scripts (and muscle memory) still expect the old
+    # standalone `docker-compose` (hyphenated) binary rather than typing
+    # `docker compose` (v2 subcommand). We only ever install the v2 plugin -
+    # provide a thin forwarding shim so the hyphenated form also works,
+    # rather than it just failing with "command not found". No-op if
+    # something already provides docker-compose.
+    if ! command -v docker-compose >/dev/null 2>&1; then
+        if $DRY_RUN; then
+            echo "[dry-run] would write a docker-compose -> 'docker compose' shim to $HOME/bin/docker-compose"
+        else
+            mkdir -p "$HOME/bin"
+            cat > "$HOME/bin/docker-compose" <<'SHIM'
+#!/bin/sh
+exec docker compose "$@"
+SHIM
+            chmod +x "$HOME/bin/docker-compose"
+            log "Added a docker-compose -> 'docker compose' shim at $HOME/bin/docker-compose (for tooling/scripts expecting the old binary name)."
+        fi
+    fi
+}
+
+# Rootless Docker's own installer prints an [INFO] telling you to add PATH/
+# DOCKER_HOST to ~/.bashrc yourself - `export`ing them in this script only
+# affects this script's own process, so a fresh shell/SSH session would
+# still have neither, and "docker"/"docker compose" would just not be found
+# until the user did this by hand. Do it for them, idempotently.
+persist_rootless_docker_env() {
+    local rc_file="$HOME/.bashrc"
+    local marker="# Added by eka-webhook deploy-local.sh (rootless Docker)"
+    grep -qF "$marker" "$rc_file" 2>/dev/null && return 0
 
     if $DRY_RUN; then
-        echo "[dry-run] would run: mkdir -p ~/.docker/cli-plugins && curl -fsSL $compose_url -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose"
+        echo "[dry-run] would append PATH/DOCKER_HOST exports for rootless Docker to $rc_file"
     else
-        mkdir -p "$HOME/.docker/cli-plugins"
-        curl -fsSL "$compose_url" -o "$HOME/.docker/cli-plugins/docker-compose" || {
-            echo "Error: failed to download the Docker Compose plugin from $compose_url" >&2
-            exit 1
-        }
-        chmod +x "$HOME/.docker/cli-plugins/docker-compose"
-        docker compose version >/dev/null 2>&1 || {
-            echo "Error: Docker Compose plugin installed but 'docker compose version' still fails." >&2
-            exit 1
-        }
+        {
+            echo ""
+            echo "$marker"
+            echo 'export PATH="$HOME/bin:$PATH"'
+            echo 'export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"'
+        } >> "$rc_file"
+        log "Added rootless Docker's PATH/DOCKER_HOST to $rc_file - open a new shell (or 'source $rc_file') to use 'docker'/'docker compose' directly, without the ~/bin/ prefix."
     fi
 }
 
@@ -545,8 +605,7 @@ step_docker_install() {
         log "Docker already installed"
     else
         if ! $NONINTERACTIVE; then
-            read -r -p "Docker not found. Install rootless Docker now? [y/N]: " CONFIRM
-            [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: Docker is required (or re-run with --skip-docker-install once installed)."; exit 1; }
+            confirm "Docker not found. Install rootless Docker now?" || { echo "Aborting: Docker is required (or re-run with --skip-docker-install once installed)."; exit 1; }
         fi
         ensure_installed "rootless Docker" iptables newuidmap
         ensure_kernel_modules nf_tables ip_tables
@@ -576,6 +635,7 @@ step_docker_install() {
                 log "Warning: could not enable linger for $(whoami) - docker.service will stop when you log out of this session. Run 'sudo loginctl enable-linger $(whoami)' manually to fix, then 're-login' or reboot."
             export PATH="$HOME/bin:$PATH"
             export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+            persist_rootless_docker_env
         fi
     fi
 
@@ -601,8 +661,7 @@ ensure_unprivileged_ports() {
     if [ "$start_port" -gt "$min_port" ]; then
         log "Ports $http_port/$https_port need net.ipv4.ip_unprivileged_port_start=$min_port for rootless Docker to bind them."
         if ! $NONINTERACTIVE; then
-            read -r -p "Apply this via sudo now (writes /etc/sysctl.d/90-eka-rootless-ports.conf)? [y/N]: " CONFIRM
-            [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: cannot bind privileged ports without this."; exit 1; }
+            confirm "Apply this via sudo now (writes /etc/sysctl.d/90-eka-rootless-ports.conf)?" || { echo "Aborting: cannot bind privileged ports without this."; exit 1; }
         fi
         if $DRY_RUN; then
             echo "[dry-run] would run: sudo sh -c 'echo net.ipv4.ip_unprivileged_port_start=$min_port > /etc/sysctl.d/90-eka-rootless-ports.conf && sysctl --system'"
@@ -670,6 +729,13 @@ step_generate_env() {
     set_env_var "$CONFIG_FILE" APP_IMAGE "$APP_IMAGE"
 
     ask "Client integration to use (metropolis/miracles)" CLIENT_NAME "metropolis" false true
+    while [[ "$CLIENT_NAME" != "metropolis" && "$CLIENT_NAME" != "miracles" ]]; do
+        if $NONINTERACTIVE; then
+            echo "Error: CLIENT_NAME must be 'metropolis' or 'miracles' (got '$CLIENT_NAME')." >&2
+            exit 1
+        fi
+        read -r -p "CLIENT_NAME must be 'metropolis' or 'miracles' - try again: " CLIENT_NAME
+    done
     set_env_var "$CONFIG_FILE" CLIENT_NAME "$CLIENT_NAME"
 
     [ "${CLIENT_ID:-}" == "YOUR_CLIENT_ID" ] && CLIENT_ID=""
@@ -756,7 +822,7 @@ step_build_and_start() {
             echo "[dry-run] would run: certbot certonly --webroot -w /var/www/certbot -d $domain"
             echo "[dry-run] would render nginx/ssl-enabled/nginx-https.conf and reload nginx"
         else
-            if ! compose run --rm certbot certonly --webroot -w /var/www/certbot \
+            if ! compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot \
                 -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --no-eff-email; then
                 echo "Error: certificate issuance failed. Check DNS points $domain at this host, then retry with 'install'." >&2
                 compose down || true
@@ -999,8 +1065,7 @@ cmd_upgrade() {
 cmd_stop() {
     load_config_file
     if ! $NONINTERACTIVE; then
-        read -r -p "This stops and removes eka-webhook containers (volumes/certs/network are kept). Continue? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        confirm "This stops and removes eka-webhook containers (volumes/certs/network are kept). Continue?" || { echo "Aborted."; exit 0; }
     fi
     compose down
     echo "Containers stopped and removed. Config, volumes, certs, and the eka-net network were left in place."
@@ -1010,13 +1075,11 @@ cmd_stop() {
 cmd_uninstall() {
     load_config_file
     if ! $NONINTERACTIVE; then
-        read -r -p "This stops and removes eka-webhook containers and named volumes. Continue? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        confirm "This stops and removes eka-webhook containers and named volumes. Continue?" || { echo "Aborted."; exit 0; }
     fi
     compose down -v
     if ! $NONINTERACTIVE; then
-        read -r -p "Also remove the docker network 'eka-net'? [y/N]: " CONFIRM
-        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        if confirm "Also remove the docker network 'eka-net'?"; then
             docker network rm eka-net 2>/dev/null || true
         fi
     fi

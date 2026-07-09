@@ -12,6 +12,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CLIENT_NAME: ${CLIENT_NAME:-eka}
     image: ${APP_IMAGE:-eka-webhook:local}
     container_name: eka-webhook-app
     restart: unless-stopped

@@ -1,5 +1,7 @@
 FROM python:3.10-slim
 
+ARG CLIENT_NAME
+
 WORKDIR /app
 
 COPY requirements.txt ./
@@ -13,8 +15,7 @@ COPY message_integration.py ./
 COPY template_configs.py ./
 COPY config_loader.py ./
 COPY config.yaml ./
-COPY metropolis ./metropolis
-COPY miracles ./miracles
+COPY ${CLIENT_NAME} ./${CLIENT_NAME}
 
 ENV PORT=8080
 EXPOSE 8080
