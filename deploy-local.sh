@@ -41,6 +41,18 @@ SKIP_DOCKER_INSTALL=false
 # NONINTERACTIVE (which also gates sudo confirmations for system changes -
 # those must still be asked regardless of this).
 CONFIG_CONFIRMED=false
+# Space-separated, UPPERCASE list of field names the user explicitly asked
+# to change (see confirm_existing_config()) when they didn't want the whole
+# file as-is but also didn't want to walk every field one by one. Empty
+# means "no specific list" - normal per-field behavior applies.
+FIELDS_TO_CHANGE=""
+
+field_should_prompt() {
+    case " $FIELDS_TO_CHANGE " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 CLI_PORT=""
 CLI_EXTERNAL_URL=""
 CLI_SSL_MODE=""
@@ -437,7 +449,14 @@ ask() {
     local current="${!varname:-}"
 
     if [ -n "$current" ]; then
-        if [ "$confirm_existing" != "true" ] || $NONINTERACTIVE || $CONFIG_CONFIRMED; then return 0; fi
+        local want_prompt=false
+        if [ -n "$FIELDS_TO_CHANGE" ]; then
+            field_should_prompt "$varname" && want_prompt=true
+        elif [ "$confirm_existing" == "true" ] && ! $NONINTERACTIVE && ! $CONFIG_CONFIRMED; then
+            want_prompt=true
+        fi
+        $want_prompt || return 0
+
         local shown="$current" answer
         if [ "$secret" == "true" ]; then
             shown="(hidden)"
@@ -775,10 +794,18 @@ step_generate_env() {
                 log "Generated SIGNING_KEY"
             fi
         fi
-    elif ! $NONINTERACTIVE && ! $CONFIG_CONFIRMED; then
-        local new_signing_key
-        read -r -p "Signing Key [existing: (hidden), Enter to keep]: " new_signing_key
-        [ -n "$new_signing_key" ] && SIGNING_KEY="$new_signing_key"
+    else
+        local want_signing_prompt=false
+        if [ -n "$FIELDS_TO_CHANGE" ]; then
+            field_should_prompt "SIGNING_KEY" && want_signing_prompt=true
+        elif ! $NONINTERACTIVE && ! $CONFIG_CONFIRMED; then
+            want_signing_prompt=true
+        fi
+        if $want_signing_prompt; then
+            local new_signing_key
+            read -r -p "Signing Key [existing: (hidden), Enter to keep]: " new_signing_key
+            [ -n "$new_signing_key" ] && SIGNING_KEY="$new_signing_key"
+        fi
     fi
     set_env_var "$CONFIG_FILE" SIGNING_KEY "$SIGNING_KEY"
 
@@ -828,28 +855,66 @@ step_build_and_start() {
         exit 1
     fi
 
-    if [ "$SSL_MODE" == "managed" ] && [ ! -f "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf" ]; then
-        local domain
-        domain=$(echo "$EXTERNAL_URL" | sed -E 's#^https?://##' | sed -E 's#/.*$##')
-        log "Requesting a Let's Encrypt certificate for $domain..."
-        if $DRY_RUN; then
-            echo "[dry-run] would run: certbot certonly --webroot -w /var/www/certbot -d $domain"
-            echo "[dry-run] would render nginx/ssl-enabled/nginx-https.conf and reload nginx"
-        else
-            if ! compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot \
-                -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --no-eff-email; then
-                echo "Error: certificate issuance failed. Check DNS points $domain at this host, then retry with 'install'." >&2
-                compose down || true
-                exit 1
-            fi
-            EXTERNAL_DOMAIN="$domain" PORT="$PORT" HTTPS_PORT="${HTTPS_PORT:-443}" \
-                envsubst '${EXTERNAL_DOMAIN} ${PORT} ${HTTPS_PORT}' \
-                < "$SCRIPT_DIR/nginx/nginx-https.conf.example" > "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf"
-            compose exec nginx nginx -s reload
-        fi
+    state_mark_done "build_and_start"
+}
+
+# Prints what's needed to enable HTTPS once DNS is actually pointed here -
+# shared by the failure path below and step_finalize's end-of-run summary.
+print_ssl_todo() {
+    local domain="$1"
+    echo "  To enable HTTPS:"
+    echo "    1. Point a DNS A record for $domain at this host's public IP."
+    echo "    2. Verify it resolves:  dig +short $domain"
+    echo "    3. Re-run:              $0 install"
+    echo "       (this only retries the certificate step - nothing else is redone)"
+}
+
+# SSL is deliberately NOT mandatory for the app to run - the most common
+# failure here is DNS simply not pointing at this host yet (e.g. a client
+# hasn't set it up by the time this runs), and the app is already reachable
+# over plain HTTP via nginx's phase-1 bootstrap config regardless of whether
+# this succeeds. On failure this asks whether to continue running over HTTP
+# rather than tearing the whole deployment down, and is only marked done on
+# actual success - so a later plain 'install' re-run (once DNS is fixed)
+# automatically retries just this step, no --fresh needed.
+step_ssl_cert() {
+    [ "$SSL_MODE" == "managed" ] || return 0
+    if [ -f "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf" ]; then
+        return 0
+    fi
+    if step_done "ssl_cert" && ! $FRESH; then log "ssl_cert: already done, skipping"; return; fi
+
+    local domain
+    domain=$(echo "$EXTERNAL_URL" | sed -E 's#^https?://##' | sed -E 's#/.*$##')
+    log "Requesting a Let's Encrypt certificate for $domain..."
+    if $DRY_RUN; then
+        echo "[dry-run] would run: certbot certonly --webroot -w /var/www/certbot -d $domain"
+        echo "[dry-run] would render nginx/ssl-enabled/nginx-https.conf and reload nginx"
+        return 0
     fi
 
-    state_mark_done "build_and_start"
+    if compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot \
+        -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --no-eff-email; then
+        EXTERNAL_DOMAIN="$domain" PORT="$PORT" HTTPS_PORT="${HTTPS_PORT:-443}" \
+            envsubst '${EXTERNAL_DOMAIN} ${PORT} ${HTTPS_PORT}' \
+            < "$SCRIPT_DIR/nginx/nginx-https.conf.example" > "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf"
+        compose exec nginx nginx -s reload
+        state_mark_done "ssl_cert"
+        log "Certificate issued - $EXTERNAL_URL is now served over HTTPS."
+        return 0
+    fi
+
+    echo "Warning: certificate issuance failed for $domain (see certbot output above - usually DNS not pointing here yet)." >&2
+    if $NONINTERACTIVE; then
+        log "Continuing over plain HTTP (--non-interactive: not prompting). Re-run 'install' once DNS is fixed to retry."
+    elif ! confirm "Continue running the app over plain HTTP for now (fix DNS and retry SSL later)?"; then
+        echo "Aborting: fix DNS for $domain, then re-run 'install' to retry." >&2
+        compose down || true
+        exit 1
+    fi
+    echo
+    print_ssl_todo "$domain"
+    echo
 }
 
 step_health_check() {
@@ -909,8 +974,17 @@ step_webhook_register() {
 step_finalize() {
     log "Deployment complete."
     echo "  URL:          ${EXTERNAL_URL:-http://<this-host>:${PORT}}"
-    if [ "$SSL_MODE" == "managed" ] && [ "${HTTPS_PORT:-443}" != "443" ]; then
-        echo "                (nginx is listening on non-standard HTTPS_PORT=$HTTPS_PORT - include it in the URL: ${EXTERNAL_URL}:${HTTPS_PORT})"
+    if [ "$SSL_MODE" == "managed" ]; then
+        if [ -f "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf" ]; then
+            if [ "${HTTPS_PORT:-443}" != "443" ]; then
+                echo "                (nginx is listening on non-standard HTTPS_PORT=$HTTPS_PORT - include it in the URL: ${EXTERNAL_URL}:${HTTPS_PORT})"
+            fi
+        else
+            local ssl_domain
+            ssl_domain=$(echo "$EXTERNAL_URL" | sed -E 's#^https?://##' | sed -E 's#/.*$##')
+            echo "  SSL:          not yet enabled - serving plain HTTP only on port ${HTTP_PORT:-80} for now."
+            print_ssl_todo "$ssl_domain"
+        fi
     fi
     echo "  Config file:  $CONFIG_FILE"
     local profile_flag=""
@@ -1036,6 +1110,14 @@ confirm_existing_config() {
     if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
         log "Using $(basename "$CONFIG_FILE") as-is for this run."
         CONFIG_CONFIRMED=true
+        return
+    fi
+
+    local fields
+    read -r -p "Which field(s) do you want to change? (space/comma-separated names, e.g. CLIENT_SECRET API_KEY - leave blank to review every field one by one): " fields
+    if [ -n "$fields" ]; then
+        FIELDS_TO_CHANGE=$(echo "$fields" | tr ',' ' ' | tr '[:lower:]' '[:upper:]')
+        log "Only re-prompting for: $FIELDS_TO_CHANGE - everything else keeps its value from $(basename "$CONFIG_FILE")."
     fi
 }
 
@@ -1053,6 +1135,7 @@ cmd_install() {
     step_generate_env
     step_config_validate
     step_build_and_start
+    step_ssl_cert
     step_health_check
     step_webhook_register
     step_finalize
