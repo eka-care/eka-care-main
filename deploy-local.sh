@@ -926,7 +926,12 @@ step_health_check() {
     fi
 
     local attempt=0 max=15
-    until curl -sf -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" 2>/dev/null | grep -q '404'; do
+    # No -f here deliberately: we're expecting (and grep-matching) a 404, and
+    # -f makes curl itself exit non-zero on 4xx/5xx - combined with this
+    # script's `set -o pipefail`, that poisons the pipeline's exit status
+    # even when grep successfully matches, so the loop could never succeed
+    # no matter how healthy the app actually was.
+    until curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" 2>/dev/null | grep -q '404'; do
         attempt=$((attempt + 1))
         if [ "$attempt" -ge "$max" ]; then
             echo "Error: app did not become healthy on port $PORT after $max attempts." >&2
