@@ -155,6 +155,30 @@ ensure_kernel_module() {
     fi
 }
 
+# get.docker.com/rootless extracts the dockerd binary to ~/bin *before*
+# running its own prereq checks (e.g. the nf_tables one above). If an earlier
+# run died after that extraction but before finishing, the installer sees
+# the leftover binary on retry, refuses to do anything, and just prints
+# manual cleanup instructions - leaving Docker not actually installed. Detect
+# that exact leftover and clean it up automatically instead of failing again.
+ensure_clean_rootless_install() {
+    local dockerd_bin="$HOME/bin/dockerd"
+    [ -e "$dockerd_bin" ] || return 0
+
+    log "Found a leftover rootless Docker binary at $dockerd_bin from a previous incomplete install."
+    if ! $NONINTERACTIVE; then
+        read -r -p "Remove it and retry installation? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: remove $dockerd_bin manually (after 'systemctl --user stop docker') and re-run, or pass --skip-docker-install if Docker is already usable."; exit 1; }
+    fi
+    if $DRY_RUN; then
+        echo "[dry-run] would run: systemctl --user stop docker (best-effort)"
+        echo "[dry-run] would run: rm -f $dockerd_bin"
+    else
+        systemctl --user stop docker 2>/dev/null || true
+        rm -f "$dockerd_bin"
+    fi
+}
+
 # ---- CLI parsing ----------------------------------------------------------
 
 ACTION="install"
@@ -397,13 +421,22 @@ step_docker_install() {
         fi
         ensure_installed "rootless Docker" iptables newuidmap
         ensure_kernel_module nf_tables
+        ensure_clean_rootless_install
 
         if $DRY_RUN; then
             echo "[dry-run] would run: curl -fsSL https://get.docker.com/rootless | sh"
             echo "[dry-run] would run: systemctl --user enable --now docker"
             echo "[dry-run] would run: loginctl enable-linger \$(whoami)"
         else
-            curl -fsSL https://get.docker.com/rootless | sh
+            curl -fsSL https://get.docker.com/rootless | sh || {
+                echo "Error: rootless Docker install script failed (see output above)." >&2
+                exit 1
+            }
+            if ! systemctl --user list-unit-files docker.service >/dev/null 2>&1; then
+                echo "Error: rootless Docker install script did not finish creating the docker.service user unit." >&2
+                echo "It may have detected a leftover/partial install and printed manual cleanup steps above - follow those and re-run." >&2
+                exit 1
+            fi
             systemctl --user enable --now docker
             loginctl enable-linger "$(whoami)"
             export PATH="$HOME/bin:$PATH"
