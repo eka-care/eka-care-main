@@ -21,8 +21,8 @@ response.txt
 # Secrets / local config - must never be baked into an image
 config-aws.env
 config-aws.env.example
-config-local.env
-config-local.env.example
+config.env
+config.env.example
 .env
 
 # Local/VM stack files - only consumed by docker compose on the host, not the app

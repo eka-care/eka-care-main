@@ -2,7 +2,7 @@
 # decides what actually runs:
 #   - app always runs.
 #   - nginx/certbot only run when deploy-local.sh passes `--profile ssl`
-#     (i.e. SSL_MODE=managed in config-local.env).
+#     (i.e. SSL_MODE=managed in config.env).
 #   - APP_BIND_ADDR is set by deploy-local.sh: 0.0.0.0 when there's no proxy
 #     in front (SSL_MODE=external), 127.0.0.1 when nginx is fronting it
 #     (SSL_MODE=managed) so the app is never reachable except through nginx.
@@ -16,7 +16,7 @@ services:
     container_name: eka-webhook-app
     restart: unless-stopped
     env_file:
-      - config-local.env
+      - config.env
     ports:
       - "${APP_BIND_ADDR:-0.0.0.0}:${PORT:-8080}:${PORT:-8080}"
     networks:

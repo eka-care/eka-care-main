@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/config-local.env"
+CONFIG_FILE="$SCRIPT_DIR/config.env"
 STATE_DIR="$HOME/.eka-deploy"
 STATE_FILE="$STATE_DIR/state.json"
 
@@ -21,6 +21,12 @@ FRESH=false
 DEBUG=false
 NONINTERACTIVE=false
 SKIP_DOCKER_INSTALL=false
+# Set true once the user confirms an existing config.env is fine as-is
+# (see confirm_existing_config()) - suppresses ask()'s per-field "existing:
+# ..., Enter to keep" walkthrough for already-set values, WITHOUT touching
+# NONINTERACTIVE (which also gates sudo confirmations for system changes -
+# those must still be asked regardless of this).
+CONFIG_CONFIRMED=false
 CLI_PORT=""
 CLI_EXTERNAL_URL=""
 CLI_SSL_MODE=""
@@ -50,8 +56,8 @@ Options:
   --debug                   Verbose output (set -x, no curl silencing)
   --non-interactive         Never prompt; fail if a required value is missing
   --skip-docker-install     Assume Docker/compose are already installed
-  --env-file PATH            Path to the env file (default: config-local.env,
-                              materialized from config-local.env.example if missing)
+  --env-file PATH            Path to the env file (default: config.env,
+                              materialized from config.env.example if missing)
   --port PORT
   --external-url URL
   --ssl-mode managed|external
@@ -187,6 +193,50 @@ ensure_clean_rootless_install() {
     fi
 }
 
+# Ubuntu 23.10+/24.04+ restricts unprivileged user namespaces via AppArmor by
+# default (kernel.apparmor_restrict_unprivileged_userns=1). rootlesskit's
+# re-exec of /proc/self/exe to set up the userns then fails with "permission
+# denied", and dockerd-rootless-setuptool.sh has no automated recovery for
+# it. Pre-install the exact AppArmor profile Docker's own error message
+# recommends - scoped to this user's rootlesskit path - before attempting
+# the install, instead of failing partway through it. The profile doesn't
+# need rootlesskit to already exist at that path; AppArmor just won't do
+# anything with the rule until a process actually runs from there.
+ensure_apparmor_userns_allowed() {
+    local restrict_file="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+    [ -f "$restrict_file" ] || return 0
+    [ "$(cat "$restrict_file" 2>/dev/null)" == "1" ] || return 0
+    command -v apparmor_parser >/dev/null 2>&1 || return 0
+
+    local rootlesskit_bin="$HOME/bin/rootlesskit"
+    local profile_name profile_path
+    profile_name="$(echo "$rootlesskit_bin" | sed -e 's#^/##' -e 's#/#.#g')"
+    profile_path="/etc/apparmor.d/$profile_name"
+    [ -f "$profile_path" ] && return 0
+
+    log "AppArmor is restricting unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1) - rootless Docker's rootlesskit needs an exemption, or it fails with 'permission denied'."
+    if ! $NONINTERACTIVE; then
+        read -r -p "Install an AppArmor profile allowing rootlesskit ($rootlesskit_bin) unconfined userns access, via sudo? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker cannot start without this. See https://rootlesscontaine.rs/getting-started/common/"; exit 1; }
+    fi
+
+    if $DRY_RUN; then
+        echo "[dry-run] would write $profile_path and run: sudo systemctl restart apparmor.service"
+    else
+        cat <<EOF | sudo tee "$profile_path" >/dev/null
+abi <abi/4.0>,
+include <tunables/global>
+
+$rootlesskit_bin flags=(unconfined) {
+  userns,
+
+  include if exists <local/$profile_name>
+}
+EOF
+        sudo systemctl restart apparmor.service
+    fi
+}
+
 # get.docker.com/rootless installs core Docker (dockerd/docker/containerd/runc)
 # but NOT the Compose CLI plugin - "docker compose" comes back as "unknown
 # command" until this is installed separately, regardless of whether Docker
@@ -259,7 +309,7 @@ $DEBUG && set -x
 ensure_installed "deploy-local.sh" curl jq
 
 # ---- state file (~/.eka-deploy/state.json) --------------------------------
-# Tracks step completion only. Actual answers/secrets live in config-local.env
+# Tracks step completion only. Actual answers/secrets live in config.env
 # (the single source of truth), never duplicated here.
 
 state_init() {
@@ -283,7 +333,7 @@ state_mark_done() {
 
 step_done() { [ "$(state_step_status "$1")" == "done" ]; }
 
-# ---- config-local.env helpers ----------------------------------------------
+# ---- config.env helpers ----------------------------------------------
 
 set_env_var() {
     local file="$1" key="$2" value="$3"
@@ -313,7 +363,7 @@ ask() {
     local current="${!varname:-}"
 
     if [ -n "$current" ]; then
-        if [ "$confirm_existing" != "true" ] || $NONINTERACTIVE; then return 0; fi
+        if [ "$confirm_existing" != "true" ] || $NONINTERACTIVE || $CONFIG_CONFIRMED; then return 0; fi
         local shown="$current" answer
         if [ "$secret" == "true" ]; then
             shown="(hidden)"
@@ -501,6 +551,7 @@ step_docker_install() {
         ensure_installed "rootless Docker" iptables newuidmap
         ensure_kernel_modules nf_tables ip_tables
         ensure_clean_rootless_install
+        ensure_apparmor_userns_allowed
 
         if $DRY_RUN; then
             echo "[dry-run] would run: curl -fsSL https://get.docker.com/rootless | sh"
@@ -644,7 +695,7 @@ step_generate_env() {
                 log "Generated SIGNING_KEY"
             fi
         fi
-    elif ! $NONINTERACTIVE; then
+    elif ! $NONINTERACTIVE && ! $CONFIG_CONFIRMED; then
         local new_signing_key
         read -r -p "Signing Key [existing: (hidden), Enter to keep]: " new_signing_key
         [ -n "$new_signing_key" ] && SIGNING_KEY="$new_signing_key"
@@ -677,7 +728,7 @@ step_config_validate() {
         state_mark_done "config_validate"
         return
     fi
-    compose config -q || { echo "Error: compose config validation failed - fix config-local.env and retry." >&2; exit 1; }
+    compose config -q || { echo "Error: compose config validation failed - fix config.env and retry." >&2; exit 1; }
     state_mark_done "config_validate"
 }
 
@@ -804,7 +855,7 @@ load_config_file() {
         fi
     fi
     set -a
-    # shellcheck source=config-local.env
+    # shellcheck source=config.env
     [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
     set +a
 }
@@ -866,8 +917,54 @@ verify_setup() {
     fi
 }
 
+# Some users hand-craft config.env before running install instead of
+# answering prompts. If it already existed before this run, show what's in
+# it (secrets masked) and ask once whether to use it as-is - if so, ask()
+# and the SIGNING_KEY prompt stop re-confirming already-set values
+# field-by-field for the rest of this run (CONFIG_CONFIRMED). Sudo
+# confirmations for system changes (Docker/iptables/kernel modules/etc.)
+# are untouched and still asked normally - this only affects config VALUES.
+# Any field still blank in the file is unaffected either way - it's
+# prompted for (or errors, under --non-interactive) as usual.
+confirm_existing_config() {
+    $NONINTERACTIVE && return 0
+
+    echo
+    log "Found an existing $(basename "$CONFIG_FILE") - here's what's configured:"
+    echo "  PORT=${PORT:-}"
+    echo "  EXTERNAL_URL=${EXTERNAL_URL:-}"
+    echo "  APP_IMAGE=${APP_IMAGE:-(build locally from Dockerfile)}"
+    echo "  SSL_MODE=${SSL_MODE:-}"
+    if [ "${SSL_MODE:-}" == "managed" ]; then
+        echo "  HTTP_PORT=${HTTP_PORT:-80}"
+        echo "  HTTPS_PORT=${HTTPS_PORT:-443}"
+    fi
+    echo "  CLIENT_NAME=${CLIENT_NAME:-}"
+    echo "  CLIENT_ID=${CLIENT_ID:-}"
+    echo "  CLIENT_SECRET=$([ -n "${CLIENT_SECRET:-}" ] && echo '(set)' || echo '(blank)')"
+    echo "  API_KEY=$([ -n "${API_KEY:-}" ] && echo '(set)' || echo '(blank)')"
+    echo "  SIGNING_KEY=$([ -n "${SIGNING_KEY:-}" ] && echo '(set)' || echo '(blank, will be generated)')"
+    if [ "${CLIENT_NAME:-}" == "metropolis" ]; then
+        echo "  YELLOW_AI_API_KEY=$([ -n "${YELLOW_AI_API_KEY:-}" ] && echo '(set)' || echo '(blank, optional)')"
+        echo "  JAPI_KEY=$([ -n "${JAPI_KEY:-}" ] && echo '(set)' || echo '(blank, optional)')"
+        echo "  JAPI_AUTHORIZATION=$([ -n "${JAPI_AUTHORIZATION:-}" ] && echo '(set)' || echo '(blank, optional)')"
+    fi
+    echo
+
+    local confirm
+    read -r -p "Use this configuration as-is (skip per-field prompts, keep every value exactly as in the file)? [Y/n]: " confirm
+    if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+        log "Using $(basename "$CONFIG_FILE") as-is for this run."
+        CONFIG_CONFIRMED=true
+    fi
+}
+
 cmd_install() {
+    local config_pre_existed=false
+    [ -f "$CONFIG_FILE" ] && config_pre_existed=true
+
     verify_setup
+    $config_pre_existed && confirm_existing_config
     state_init
     step_preflight
     step_docker_install

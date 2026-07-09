@@ -42,8 +42,11 @@ box for testing. For AWS (Lambda + API Gateway via CloudFormation), see
   e.g. Amazon Linux 2023; `ip_tables` for the legacy backend, e.g. Ubuntu -
   rootless Docker's own setup script refuses to proceed without them even
   after the `iptables` package itself is installed) - same detect-and-ask
-  flow (asked once for both) - and, if you choose managed SSL on a rootless
-  Docker setup, binding ports 80/443 (see below).
+  flow (asked once for both) - installing an AppArmor profile on Ubuntu
+  23.10+/24.04+ (which restricts unprivileged user namespaces by default,
+  breaking rootlesskit with "permission denied" otherwise) - and, if you
+  choose managed SSL on a rootless Docker setup, binding ports 80/443 (see
+  below).
 - If you already manage Docker yourself (Ansible, Chef, golden image, ...),
   pass `--skip-docker-install` and the script will just verify it's present.
 
@@ -54,10 +57,10 @@ git clone <this-repo> && cd eka-webhook
 ./deploy-local.sh install
 ```
 
-`config-local.env` isn't tracked in git - the first run creates it from
-`config-local.env.example` automatically (no separate step needed). You can
-also pre-fill it yourself before running (`cp config-local.env.example
-config-local.env && vim config-local.env`) if you'd rather not answer
+`config.env` isn't tracked in git - the first run creates it from
+`config.env.example` automatically (no separate step needed). You can
+also pre-fill it yourself before running (`cp config.env.example
+config.env && vim config.env`) if you'd rather not answer
 prompts interactively.
 
 The installer walks through, in order: system/URL checks, Docker install (if
@@ -67,14 +70,25 @@ check, and webhook registration with Eka Care. It's resumable - re-running
 `install` skips steps already marked done and only re-prompts for
 missing/invalid values.
 
-## `config-local.env`
+## `config.env`
 
 This is the single source of truth for configuration and secrets on the
 local/VM path (same role `config-aws.env` plays for the AWS path). The
 installer sources it, prompts only for blank/placeholder values, and writes
 answers back into the file. Once populated it holds real secrets - the
 installer `chmod 600`s it, and it should never leave this host (it's
-gitignored; only the placeholder `config-local.env.example` is tracked).
+gitignored; only the placeholder `config.env.example` is tracked).
+
+If you'd rather hand-craft `config.env` yourself (`cp
+config.env.example config.env && vim config.env`) than
+answer prompts, that's supported directly: if the file already exists when
+you run `install`, the installer shows a summary of what's configured
+(secrets masked) and asks once whether to use it as-is. Confirm, and it
+proceeds without walking through each already-set value individually - any
+field you left blank is still prompted for (or generated, for `SIGNING_KEY`)
+as usual. This only affects config *values* - sudo confirmations for system
+changes (installing Docker, kernel modules, etc.) are unaffected and still
+asked normally.
 
 | Variable | Meaning |
 |---|---|
@@ -128,7 +142,7 @@ Both rendered files are gitignored (installer-generated, host-specific).
 ./deploy-local.sh install                 # first-time / resume install
 ./deploy-local.sh install --dry-run       # preview every action, no mutation
 ./deploy-local.sh status                  # show step state + container status
-./deploy-local.sh upgrade --image <ref>   # deploy a specific pre-built image (also saved to config-local.env)
+./deploy-local.sh upgrade --image <ref>   # deploy a specific pre-built image (also saved to config.env)
 ./deploy-local.sh upgrade                 # re-deploy the currently configured APP_IMAGE (or rebuild locally if unset)
 ./deploy-local.sh register-webhook        # (re-)register only, no other steps
 ./deploy-local.sh stop                    # stop + remove containers only (config/volumes/certs kept)
@@ -137,7 +151,7 @@ Both rendered files are gitignored (installer-generated, host-specific).
 
 Useful flags on `install`/`upgrade`: `--fresh` (ignore saved step state),
 `--debug` (verbose), `--non-interactive` (fail instead of prompting - use
-with everything pre-filled in `config-local.env`), `--port`,
+with everything pre-filled in `config.env`), `--port`,
 `--external-url`, `--ssl-mode managed|external`, `--skip-docker-install`.
 
 ## State and logs
@@ -145,7 +159,7 @@ with everything pre-filled in `config-local.env`), `--port`,
 - Step-completion state: `~/.eka-deploy/state.json` (`chmod 600`, no secrets
   in it - just which steps are done, for idempotent resume).
 - Container logs: `./deploy-local.sh status`, or directly:
-  `docker compose --env-file config-local.env -f docker-compose.yml
+  `docker compose --env-file config.env -f docker-compose.yml
   [--profile ssl] logs -f app`
 - Log rotation is handled by Docker's `json-file` driver (10MB x 5 files per
   container) - no host-level logrotate setup needed.
