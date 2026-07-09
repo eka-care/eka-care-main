@@ -37,10 +37,12 @@ box for testing. For AWS (Lambda + API Gateway via CloudFormation), see
   `jq` if missing (above), installing Docker's own rootless-mode
   prerequisites (`iptables`, `uidmap`/`shadow-utils`/`shadow`, depending on
   your package manager) if they're not already on the box, loading the
-  `nf_tables` kernel module if it isn't already loaded (common on minimal
-  images like Amazon Linux 2023, where rootless Docker's own setup script
-  refuses to proceed without it even after `iptables-nft` is installed) -
-  same detect-and-ask flow - and, if you choose managed SSL on a rootless
+  `nf_tables` and/or `ip_tables` kernel modules if they aren't already loaded
+  (whichever the host's iptables backend needs - `nf_tables` for nftables,
+  e.g. Amazon Linux 2023; `ip_tables` for the legacy backend, e.g. Ubuntu -
+  rootless Docker's own setup script refuses to proceed without them even
+  after the `iptables` package itself is installed) - same detect-and-ask
+  flow (asked once for both) - and, if you choose managed SSL on a rootless
   Docker setup, binding ports 80/443 (see below).
 - If you already manage Docker yourself (Ansible, Chef, golden image, ...),
   pass `--skip-docker-install` and the script will just verify it's present.

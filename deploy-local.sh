@@ -133,26 +133,33 @@ ensure_installed() {
     fi
 }
 
-# Ensures a kernel module is loaded - rootless Docker's setup script checks
-# for nf_tables itself and refuses to proceed on minimal images (e.g. Amazon
-# Linux 2023) where nothing's triggered netfilter yet, even once iptables-nft
-# is installed. No-ops with zero prompts if already loaded. Also persists it
-# via modules-load.d so a reboot doesn't reintroduce the gap.
-ensure_kernel_module() {
-    local module="$1"
-    lsmod 2>/dev/null | grep -q "^${module}[[:space:]]" && return 0
+# Ensures kernel modules are loaded - rootless Docker's setup script checks
+# for nf_tables (nftables backend) and/or ip_tables (legacy iptables
+# backend), depending on which one the host's iptables actually uses, and
+# refuses to proceed on minimal images (e.g. Amazon Linux 2023's nf_tables,
+# Ubuntu's ip_tables when on the legacy backend) where nothing's triggered
+# netfilter yet. Takes multiple module names and asks once for all of them
+# missing, rather than a separate sudo prompt per module. No-ops with zero
+# prompts if everything's already loaded. Persists them via modules-load.d
+# so a reboot doesn't reintroduce the gap.
+ensure_kernel_modules() {
+    local missing=() mod
+    for mod in "$@"; do
+        lsmod 2>/dev/null | grep -q "^${mod}[[:space:]]" || missing+=("$mod")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
 
-    log "Kernel module '$module' is not loaded (required for rootless Docker's iptables/nftables setup)."
+    log "Kernel module(s) not loaded (required for rootless Docker's iptables/nftables setup): ${missing[*]}"
     if ! $NONINTERACTIVE; then
-        read -r -p "Load kernel module '$module' now via sudo modprobe? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker requires the '$module' kernel module."; exit 1; }
+        read -r -p "Load ${missing[*]} now via sudo modprobe? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker requires: ${missing[*]}."; exit 1; }
     fi
     if $DRY_RUN; then
-        echo "[dry-run] would run: sudo modprobe $module"
-        echo "[dry-run] would run: echo $module | sudo tee /etc/modules-load.d/eka-docker.conf"
+        echo "[dry-run] would run: sudo modprobe ${missing[*]}"
+        echo "[dry-run] would run: printf '%s\\n' ${missing[*]} | sudo tee /etc/modules-load.d/eka-docker.conf"
     else
-        sudo modprobe "$module"
-        echo "$module" | sudo tee /etc/modules-load.d/eka-docker.conf >/dev/null
+        sudo modprobe "${missing[@]}"
+        printf '%s\n' "${missing[@]}" | sudo tee /etc/modules-load.d/eka-docker.conf >/dev/null
     fi
 }
 
@@ -492,7 +499,7 @@ step_docker_install() {
             [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: Docker is required (or re-run with --skip-docker-install once installed)."; exit 1; }
         fi
         ensure_installed "rootless Docker" iptables newuidmap
-        ensure_kernel_module nf_tables
+        ensure_kernel_modules nf_tables ip_tables
         ensure_clean_rootless_install
 
         if $DRY_RUN; then
