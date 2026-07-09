@@ -34,10 +34,11 @@ CLIENT_NAME=""
 
 usage() {
     cat <<EOF
-Usage: $0 [install|upgrade|uninstall|status|register-webhook|help] [options]
+Usage: $0 [install|upgrade|stop|uninstall|status|register-webhook|help] [options]
 
   install                   Run the interactive installer (default)
   upgrade                   Rebuild/pull and restart the app container
+  stop                      Stop and remove containers only (keeps config/volumes/certs)
   uninstall                 Stop and remove containers/volumes
   status                    Show install state and container status
   register-webhook          (Re-)register the webhook with Eka Care only
@@ -184,7 +185,7 @@ ensure_clean_rootless_install() {
 ACTION="install"
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        install|upgrade|uninstall|status|register-webhook|help) ACTION="$1"; shift ;;
+        install|upgrade|stop|uninstall|status|register-webhook|help) ACTION="$1"; shift ;;
         -h|--help) usage; exit 0 ;;
     esac
 fi
@@ -426,7 +427,7 @@ step_docker_install() {
         if $DRY_RUN; then
             echo "[dry-run] would run: curl -fsSL https://get.docker.com/rootless | sh"
             echo "[dry-run] would run: systemctl --user enable --now docker"
-            echo "[dry-run] would run: loginctl enable-linger \$(whoami)"
+            echo "[dry-run] would run: sudo loginctl enable-linger \$(whoami)"
         else
             curl -fsSL https://get.docker.com/rootless | sh || {
                 echo "Error: rootless Docker install script failed (see output above)." >&2
@@ -438,36 +439,46 @@ step_docker_install() {
                 exit 1
             fi
             systemctl --user enable --now docker
-            loginctl enable-linger "$(whoami)"
+            # Requires root (the installer's own [INFO] says so too - "sudo
+            # loginctl enable-linger"). Non-fatal: without it docker.service
+            # just won't survive logout/reboot until this is granted, but the
+            # daemon is already up for the rest of this run.
+            sudo loginctl enable-linger "$(whoami)" || \
+                log "Warning: could not enable linger for $(whoami) - docker.service will stop when you log out of this session. Run 'sudo loginctl enable-linger $(whoami)' manually to fix, then 're-login' or reboot."
             export PATH="$HOME/bin:$PATH"
             export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
         fi
     fi
 
-    local known_ssl_mode="${CLI_SSL_MODE:-$SSL_MODE}"
-    if [ "$known_ssl_mode" == "managed" ]; then
-        HTTP_PORT="${HTTP_PORT:-80}"
-        HTTPS_PORT="${HTTPS_PORT:-443}"
-        local min_port="$HTTP_PORT"
-        [ "$HTTPS_PORT" -lt "$min_port" ] && min_port="$HTTPS_PORT"
+    state_mark_done "docker_install"
+}
 
-        local start_port
-        start_port=$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo 1024)
-        if [ "$start_port" -gt "$min_port" ]; then
-            log "Ports $HTTP_PORT/$HTTPS_PORT need net.ipv4.ip_unprivileged_port_start=$min_port for rootless Docker to bind them."
-            if ! $NONINTERACTIVE; then
-                read -r -p "Apply this via sudo now (writes /etc/sysctl.d/90-eka-rootless-ports.conf)? [y/N]: " CONFIRM
-                [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: cannot bind privileged ports without this."; exit 1; }
-            fi
-            if $DRY_RUN; then
-                echo "[dry-run] would run: sudo sh -c 'echo net.ipv4.ip_unprivileged_port_start=$min_port > /etc/sysctl.d/90-eka-rootless-ports.conf && sysctl --system'"
-            else
-                sudo sh -c "echo net.ipv4.ip_unprivileged_port_start=$min_port > /etc/sysctl.d/90-eka-rootless-ports.conf && sysctl --system"
-            fi
+# Rootless Docker can't bind ports <1024 unless the kernel allows it (via
+# net.ipv4.ip_unprivileged_port_start). Only relevant for managed SSL
+# (nginx binds 80/443). This must run in/after step_ssl_setup - SSL_MODE
+# isn't known yet in step_docker_install (which runs first), so checking it
+# there silently skipped this fix whenever the user picks "managed"
+# interactively rather than via --ssl-mode, and nginx would then fail to
+# bind at step_build_and_start with the fix step already marked done.
+ensure_unprivileged_ports() {
+    local http_port="$1" https_port="$2"
+    local min_port="$http_port"
+    [ "$https_port" -lt "$min_port" ] && min_port="$https_port"
+
+    local start_port
+    start_port=$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo 1024)
+    if [ "$start_port" -gt "$min_port" ]; then
+        log "Ports $http_port/$https_port need net.ipv4.ip_unprivileged_port_start=$min_port for rootless Docker to bind them."
+        if ! $NONINTERACTIVE; then
+            read -r -p "Apply this via sudo now (writes /etc/sysctl.d/90-eka-rootless-ports.conf)? [y/N]: " CONFIRM
+            [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: cannot bind privileged ports without this."; exit 1; }
+        fi
+        if $DRY_RUN; then
+            echo "[dry-run] would run: sudo sh -c 'echo net.ipv4.ip_unprivileged_port_start=$min_port > /etc/sysctl.d/90-eka-rootless-ports.conf && sysctl --system'"
+        else
+            sudo sh -c "echo net.ipv4.ip_unprivileged_port_start=$min_port > /etc/sysctl.d/90-eka-rootless-ports.conf && sysctl --system"
         fi
     fi
-
-    state_mark_done "docker_install"
 }
 
 step_network_create() {
@@ -505,6 +516,7 @@ step_ssl_setup() {
             log "connects on the public port 80, so something else must forward port 80 to $HTTP_PORT"
             log "on this host, or certificate issuance will fail."
         fi
+        ensure_unprivileged_ports "$HTTP_PORT" "$HTTPS_PORT"
 
         if $DRY_RUN; then
             echo "[dry-run] would render nginx/nginx.conf (bootstrap, HTTP-only) for domain $domain"
@@ -521,6 +533,10 @@ step_ssl_setup() {
 
 step_generate_env() {
     if step_done "generate_env" && ! $FRESH; then log "generate_env: already done, skipping"; return; fi
+
+    [ -n "$CLI_IMAGE" ] && APP_IMAGE="$CLI_IMAGE"
+    ask "Pre-built image to run, e.g. ekacare/ekapython-webhook-sdk:v1.2.3 (leave blank to build from the local Dockerfile)" APP_IMAGE "" false false
+    set_env_var "$CONFIG_FILE" APP_IMAGE "$APP_IMAGE"
 
     ask "Client integration to use (metropolis/miracles)" CLIENT_NAME "metropolis" false true
     set_env_var "$CONFIG_FILE" CLIENT_NAME "$CLIENT_NAME"
@@ -584,9 +600,9 @@ step_config_validate() {
 step_build_and_start() {
     if step_done "build_and_start" && ! $FRESH; then log "build_and_start: already done, skipping"; return; fi
 
-    if [ -n "$CLI_IMAGE" ]; then
-        export APP_IMAGE="$CLI_IMAGE"
-        log "Using pre-built image $CLI_IMAGE (skipping local build)"
+    if [ -n "${APP_IMAGE:-}" ]; then
+        export APP_IMAGE
+        log "Using image $APP_IMAGE (skipping local build)"
     else
         compose build app
     fi
@@ -784,13 +800,30 @@ cmd_install() {
 cmd_upgrade() {
     verify_setup
     state_init
-    [ -n "$CLI_IMAGE" ] && export APP_IMAGE="$CLI_IMAGE"
-    if [ -z "$CLI_IMAGE" ]; then
+    [ -n "$CLI_IMAGE" ] && APP_IMAGE="$CLI_IMAGE"
+    if [ -n "${APP_IMAGE:-}" ]; then
+        export APP_IMAGE
+        set_env_var "$CONFIG_FILE" APP_IMAGE "$APP_IMAGE"
+        log "Using image $APP_IMAGE"
+    else
         compose build app
     fi
     compose up -d
     step_health_check
     log "Upgrade complete."
+}
+
+# Stops and removes containers only - volumes (certbot_certs/certbot_webroot)
+# and the eka-net network are left untouched, unlike 'uninstall' below.
+cmd_stop() {
+    load_config_file
+    if ! $NONINTERACTIVE; then
+        read -r -p "This stops and removes eka-webhook containers (volumes/certs/network are kept). Continue? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    fi
+    compose down
+    echo "Containers stopped and removed. Config, volumes, certs, and the eka-net network were left in place."
+    echo "Bring it back up with: $0 install   (or) $0 upgrade"
 }
 
 cmd_uninstall() {
@@ -831,6 +864,7 @@ cmd_register_webhook() {
 case "$ACTION" in
     install) cmd_install ;;
     upgrade) cmd_upgrade ;;
+    stop) cmd_stop ;;
     uninstall) cmd_uninstall ;;
     status) cmd_status ;;
     register-webhook) cmd_register_webhook ;;

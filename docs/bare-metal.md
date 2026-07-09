@@ -74,6 +74,7 @@ gitignored; only the placeholder `config-local.env.example` is tracked).
 |---|---|
 | `PORT` | Port the app listens on (default `8080`) |
 | `EXTERNAL_URL` | Public URL clients/Eka Care will reach this service on |
+| `APP_IMAGE` | Pre-built image to run, e.g. `ekacare/ekapython-webhook-sdk:v1.2.3` ([available tags](https://hub.docker.com/repository/docker/ekacare/ekapython-webhook-sdk/general)). Leave blank to build from the local Dockerfile instead. Set via prompt on `install`, or `./deploy-local.sh upgrade --image <ref>` (which also persists it here for future runs) |
 | `SSL_MODE` | `managed` (we run nginx+certbot for you) or `external` (you already terminate TLS in front of this host) |
 | `HTTP_PORT`, `HTTPS_PORT` | Ports nginx publishes, only used when `SSL_MODE=managed` (default `80`/`443`). `HTTP_PORT` must stay `80` unless something else forwards the public port 80 to it - Let's Encrypt's HTTP-01 challenge always connects on port 80 |
 | `CLIENT_NAME` | Which integration to load from `config.yaml` - `metropolis` or `miracles` |
@@ -121,9 +122,11 @@ Both rendered files are gitignored (installer-generated, host-specific).
 ./deploy-local.sh install                 # first-time / resume install
 ./deploy-local.sh install --dry-run       # preview every action, no mutation
 ./deploy-local.sh status                  # show step state + container status
-./deploy-local.sh upgrade --image <ref>   # deploy a specific pre-built image
+./deploy-local.sh upgrade --image <ref>   # deploy a specific pre-built image (also saved to config-local.env)
+./deploy-local.sh upgrade                 # re-deploy the currently configured APP_IMAGE (or rebuild locally if unset)
 ./deploy-local.sh register-webhook        # (re-)register only, no other steps
-./deploy-local.sh uninstall               # stop + remove containers/volumes
+./deploy-local.sh stop                    # stop + remove containers only (config/volumes/certs kept)
+./deploy-local.sh uninstall               # stop + remove containers AND volumes (certs, any app data)
 ```
 
 Useful flags on `install`/`upgrade`: `--fresh` (ignore saved step state),
