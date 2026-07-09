@@ -11,6 +11,25 @@ For bare metal / a VM / local instead, see [bare-metal.md](./bare-metal.md).
 - `jq` installed
 - AWS credentials with permissions to deploy via CloudFormation: API Gateway, Lambda, ECR, IAM, Route53
 
+The script verifies all of this itself before touching anything, scoped to
+what the action you're running actually needs:
+
+- `deploy`/`upgrade` require AWS CLI, Docker (and a *running* daemon - it
+  checks `docker info`, not just that the binary exists), and a working AWS
+  session (`aws sts get-caller-identity`, verified before any ECR/Docker Hub
+  login). If `AWS_ACCOUNT_ID` is pre-filled in `config-aws.env` but doesn't
+  match the currently authenticated account/profile, it warns (doesn't
+  fail) rather than silently deploying into the wrong account.
+- `register-webhook` needs none of that - it's a plain `curl` call to
+  `api.eka.care`, so it only requires `curl`/`jq` and never touches AWS.
+- `delete` requires AWS CLI/auth (it deletes real resources) but not Docker.
+- Outbound HTTPS (443) connectivity is checked up front for every endpoint
+  the running action will actually hit - `public.ecr.aws` (the Lambda base
+  image) and your account's ECR registry for `deploy`/`upgrade`, and
+  `api.eka.care` for `deploy`/`register-webhook` - retrying with backoff and
+  reporting every blocked endpoint together (with the exact reason: DNS
+  failure, connection refused, timeout, ...) instead of dying mid-deploy.
+
 ## Resources the script creates
 
 - ECR repository

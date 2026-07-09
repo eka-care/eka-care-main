@@ -109,7 +109,7 @@ source "$CONFIG_FILE"
 echo "Verifying deployment files..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MISSING_FILES=0
-for REQUIRED_FILE in "$TEMPLATE_FILE" "$SCRIPT_DIR/Dockerfile-aws" "$SCRIPT_DIR/lib/register-webhook.sh"; do
+for REQUIRED_FILE in "$TEMPLATE_FILE" "$SCRIPT_DIR/Dockerfile-aws" "$SCRIPT_DIR/lib/register-webhook.sh" "$SCRIPT_DIR/lib/connectivity.sh"; do
     if [ -f "$REQUIRED_FILE" ]; then
         echo "  OK       $REQUIRED_FILE"
     else
@@ -122,6 +122,16 @@ if [ "$MISSING_FILES" -eq 1 ]; then
     exit 1
 fi
 source "$SCRIPT_DIR/lib/register-webhook.sh"
+source "$SCRIPT_DIR/lib/connectivity.sh"
+
+# Required config values must not be blank (the .example ships sane defaults,
+# but a client could clear one by hand).
+for REQUIRED_VAR in STACK_NAME TEMPLATE_FILE REGION; do
+    if [[ -z "${!REQUIRED_VAR}" ]]; then
+        echo "Error: $REQUIRED_VAR must be set in $CONFIG_FILE" >&2
+        exit 1
+    fi
+done
 
 # Use command line version if provided, otherwise use config file version
 if [[ -n "$CMD_DOCKER_IMAGE_VERSION" ]]; then
@@ -146,8 +156,11 @@ API_GW_NAME="${STACK_NAME}"
 # Use stack name as the ECR repository name
 ECR_REPO_NAME="${STACK_NAME}"
 
-# Check if AWS CLI is installed
-if ! command -v aws &> /dev/null; then
+echo "Verifying prerequisites for action '$ACTION'..."
+
+# AWS CLI isn't needed to just register a webhook (that's plain curl to
+# api.eka.care) - every other action deploys/updates/deletes AWS resources.
+if [[ "$ACTION" != "register-webhook" ]] && ! command -v aws &> /dev/null; then
     echo "Error: AWS CLI is not installed. Please install it first."
     exit 1
 fi
@@ -158,19 +171,64 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# Get AWS account ID if not specified
-if [[ -z "$AWS_ACCOUNT_ID" ]]; then
-    echo "AWS_ACCOUNT_ID not specified in config, retrieving from AWS..."
-    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    if [[ $? -ne 0 || -z "$AWS_ACCOUNT_ID" ]]; then
-        echo "Error: Failed to retrieve AWS account ID. Please ensure you're authenticated with AWS CLI."
-        exit 1
-    fi
-    echo "Using AWS Account ID: $AWS_ACCOUNT_ID"
+# curl is needed by register_webhook (lib/register-webhook.sh), which every
+# action except 'delete' can end up calling.
+if [[ "$ACTION" != "delete" ]] && ! command -v curl &> /dev/null; then
+    echo "Error: curl is not installed. Please install it first."
+    exit 1
 fi
 
-# Set ECR repository URL 
+# Docker is only needed to build/push the Lambda image.
+if [[ "$ACTION" == "deploy" || "$ACTION" == "upgrade" ]]; then
+    if ! command -v docker &> /dev/null; then
+        echo "Error: Docker is not installed. Please install it first."
+        exit 1
+    fi
+    if ! docker info &> /dev/null; then
+        echo "Error: Docker is installed but the daemon isn't reachable. Is it running, and do you have permission to use it (docker group / sudo)?"
+        exit 1
+    fi
+fi
+
+# Verify AWS CLI is actually authenticated before doing anything - every
+# action but 'register-webhook' needs a working AWS session, and failing
+# here (instead of deep inside an ECR login or CloudFormation call) means
+# nothing has touched AWS yet.
+if [[ "$ACTION" != "register-webhook" ]]; then
+    echo "Verifying AWS credentials..."
+    STS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || true
+    if [[ -z "$STS_ACCOUNT_ID" ]]; then
+        echo "Error: Failed to authenticate with AWS CLI. Run 'aws configure' / 'aws sso login' and re-run this command." >&2
+        exit 1
+    fi
+    if [[ -n "$AWS_ACCOUNT_ID" && "$AWS_ACCOUNT_ID" != "$STS_ACCOUNT_ID" ]]; then
+        echo "Warning: AWS_ACCOUNT_ID in $CONFIG_FILE ($AWS_ACCOUNT_ID) does not match the currently authenticated account ($STS_ACCOUNT_ID)." >&2
+        echo "Warning: proceeding with the configured AWS_ACCOUNT_ID - double check this is the intended account/profile." >&2
+    elif [[ -z "$AWS_ACCOUNT_ID" ]]; then
+        AWS_ACCOUNT_ID="$STS_ACCOUNT_ID"
+    fi
+    echo "Authenticated as AWS Account ID: $STS_ACCOUNT_ID"
+fi
+
+# Set ECR repository URL
 ECR_REPO_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:${DOCKER_IMAGE_VERSION}"
+
+# Outbound connectivity preflight - client networks commonly block one or
+# more of these; report every blocked endpoint together (with the exact
+# reason) instead of dying deep inside a build/push/API call.
+CONN_FAILED=0
+if [[ "$ACTION" == "deploy" || "$ACTION" == "upgrade" ]]; then
+    check_connectivity "public.ecr.aws" 443 "AWS public ECR (Lambda base image)" || CONN_FAILED=1
+    check_connectivity "${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com" 443 "Your ECR repository" || CONN_FAILED=1
+fi
+if [[ "$ACTION" == "deploy" || "$ACTION" == "register-webhook" ]]; then
+    check_connectivity "api.eka.care" 443 "Eka Care API (webhook registration)" || CONN_FAILED=1
+fi
+if [[ "$CONN_FAILED" -eq 1 ]]; then
+    echo "Error: one or more required endpoints are unreachable (see FAIL lines above)." >&2
+    echo "Ask your network/security team to allow outbound HTTPS to them, then re-run this command." >&2
+    exit 1
+fi
 
 # Function to set up ECR and deploy Docker image
 setup_ecr_and_deploy_image() {
@@ -228,18 +286,24 @@ setup_ecr_and_deploy_image() {
     echo "Docker image successfully pushed to ECR."
 }
 
-# Extract domain name from EXTERNAL_URL
-if [[ -n "$EXTERNAL_URL" ]]; then
+# Extract domain name from EXTERNAL_URL - only deploy/upgrade need this
+# (they call generate_parameters, which requires HOSTED_ZONE_ID); doing it
+# unconditionally forced 'register-webhook' and 'delete' to depend on AWS/
+# Route53 access they never actually use.
+if [[ ( "$ACTION" == "deploy" || "$ACTION" == "upgrade" ) && -n "$EXTERNAL_URL" ]]; then
     DOMAIN_NAME=$(echo "$EXTERNAL_URL" | sed -E 's|^https?://||' | sed -E 's|/.*$||')
     echo "Extracted domain name: $DOMAIN_NAME"
-    
+
     # Try to find the hosted zone ID for the domain
     if [[ -z "$HOSTED_ZONE_ID" ]]; then
         echo "Looking up hosted zone ID for domain $DOMAIN_NAME..."
-        
+
         # Get all hosted zones
-        ZONES_JSON=$(aws route53 list-hosted-zones --output json)
-        
+        ZONES_JSON=$(aws route53 list-hosted-zones --output json) || {
+            echo "Error: Failed to list Route53 hosted zones. Check AWS permissions/connectivity." >&2
+            exit 1
+        }
+
         # Find the most specific matching zone for the domain
         LONGEST_MATCH=""
         MATCHED_ZONE_ID=""

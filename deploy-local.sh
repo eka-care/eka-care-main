@@ -13,6 +13,8 @@ STATE_FILE="$STATE_DIR/state.json"
 
 # shellcheck source=lib/register-webhook.sh
 source "$SCRIPT_DIR/lib/register-webhook.sh"
+# shellcheck source=lib/connectivity.sh
+source "$SCRIPT_DIR/lib/connectivity.sh"
 
 DRY_RUN=false
 FRESH=false
@@ -60,6 +62,98 @@ EOF
 log() { echo "[eka-deploy] $*"; }
 debug() { $DEBUG && echo "[debug] $*" >&2; true; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' is required but not installed." >&2; exit 1; }; }
+# Random hex string straight from the kernel's CSPRNG - no openssl (or any
+# other external binary) needed just to generate a signing key.
+random_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
+
+detect_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then echo "apt-get"
+    elif command -v dnf >/dev/null 2>&1; then echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then echo "yum"
+    elif command -v zypper >/dev/null 2>&1; then echo "zypper"
+    fi
+}
+
+# Package name for a missing binary, per package manager - centralizes the
+# apt/dnf/yum/zypper naming differences so callers just list binaries.
+pkg_name_for() {
+    local bin="$1" mgr="$2"
+    case "$bin:$mgr" in
+        curl:*|jq:*|iptables:*) echo "$bin" ;;
+        newuidmap:apt-get) echo "uidmap" ;;
+        newuidmap:dnf|newuidmap:yum) echo "shadow-utils" ;;
+        newuidmap:zypper) echo "shadow" ;;
+    esac
+}
+
+# Checks the given binaries; if any are missing, detects the host's package
+# manager and offers to install the right packages for it (sudo confirmation,
+# respects --dry-run/--non-interactive). No-ops with zero prompts if
+# everything's already present. Used both for baseline tools (curl, jq) and
+# for rootless Docker's own prerequisites (iptables, newuidmap).
+ensure_installed() {
+    local purpose="$1"; shift
+    local missing_bins=() bin
+    for bin in "$@"; do
+        command -v "$bin" >/dev/null 2>&1 || missing_bins+=("$bin")
+    done
+    [ "${#missing_bins[@]}" -eq 0 ] && return 0
+
+    local mgr
+    mgr=$(detect_pkg_manager)
+    if [ -z "$mgr" ]; then
+        log "Warning: missing ${missing_bins[*]} for $purpose, and no known package manager (apt-get/dnf/yum/zypper) detected."
+        log "Install these manually before continuing."
+        return 0
+    fi
+
+    local pkgs=()
+    for bin in "${missing_bins[@]}"; do
+        pkgs+=("$(pkg_name_for "$bin" "$mgr")")
+    done
+
+    local install_cmd
+    case "$mgr" in
+        apt-get) install_cmd="sudo apt-get update && sudo apt-get install -y ${pkgs[*]}" ;;
+        dnf)     install_cmd="sudo dnf install -y ${pkgs[*]}" ;;
+        yum)     install_cmd="sudo yum install -y ${pkgs[*]}" ;;
+        zypper)  install_cmd="sudo zypper install -y ${pkgs[*]}" ;;
+    esac
+
+    log "$purpose needs: ${missing_bins[*]} (missing). Package(s) to install via $mgr: ${pkgs[*]}"
+    if ! $NONINTERACTIVE; then
+        read -r -p "Install missing prerequisites (${pkgs[*]}) via sudo $mgr now? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: $purpose requires ${missing_bins[*]}."; exit 1; }
+    fi
+    if $DRY_RUN; then
+        echo "[dry-run] would run: $install_cmd"
+    else
+        eval "$install_cmd"
+    fi
+}
+
+# Ensures a kernel module is loaded - rootless Docker's setup script checks
+# for nf_tables itself and refuses to proceed on minimal images (e.g. Amazon
+# Linux 2023) where nothing's triggered netfilter yet, even once iptables-nft
+# is installed. No-ops with zero prompts if already loaded. Also persists it
+# via modules-load.d so a reboot doesn't reintroduce the gap.
+ensure_kernel_module() {
+    local module="$1"
+    lsmod 2>/dev/null | grep -q "^${module}[[:space:]]" && return 0
+
+    log "Kernel module '$module' is not loaded (required for rootless Docker's iptables/nftables setup)."
+    if ! $NONINTERACTIVE; then
+        read -r -p "Load kernel module '$module' now via sudo modprobe? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker requires the '$module' kernel module."; exit 1; }
+    fi
+    if $DRY_RUN; then
+        echo "[dry-run] would run: sudo modprobe $module"
+        echo "[dry-run] would run: echo $module | sudo tee /etc/modules-load.d/eka-docker.conf"
+    else
+        sudo modprobe "$module"
+        echo "$module" | sudo tee /etc/modules-load.d/eka-docker.conf >/dev/null
+    fi
+}
 
 # ---- CLI parsing ----------------------------------------------------------
 
@@ -92,8 +186,7 @@ done
 [ -n "$CLI_ENV_FILE" ] && CONFIG_FILE="$CLI_ENV_FILE"
 
 $DEBUG && set -x
-require_cmd curl
-require_cmd jq
+ensure_installed "deploy-local.sh" curl jq
 
 # ---- state file (~/.eka-deploy/state.json) --------------------------------
 # Tracks step completion only. Actual answers/secrets live in config-local.env
@@ -172,47 +265,8 @@ ask() {
 }
 
 # ---- network / connectivity helpers ---------------------------------------
-
-# Sets LAST_TCP_ERROR to bash's own /dev/tcp error text (e.g. "Name or
-# service not known" for a DNS failure, "Connection refused", "Connection
-# timed out") so callers can report exactly why an endpoint was unreachable,
-# not just that it was.
-check_tcp() {
-    local host="$1" port="$2"
-    LAST_TCP_ERROR=""
-    local err status
-    if command -v timeout >/dev/null 2>&1; then
-        err=$(timeout 5 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>&1 >/dev/null)
-    else
-        err=$(bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>&1 >/dev/null)
-    fi
-    status=$?
-    LAST_TCP_ERROR=$(echo "$err" | sed -E 's/^bash: (line [0-9]+: )?//' | paste -sd '; ' -)
-    return $status
-}
-
-# Retries a single endpoint with backoff before giving up - client firewalls
-# often block outbound traffic, and a single flaky attempt shouldn't fail the
-# whole install. Does not exit: returns 1 so the caller can check every
-# endpoint and report all blocked ones together, not just the first.
-check_connectivity() {
-    local host="$1" port="$2" label="$3"
-    local attempt=1 max=3 delay=3
-    while true; do
-        if check_tcp "$host" "$port"; then
-            log "  OK    $label ($host:$port)"
-            return 0
-        fi
-        if [ "$attempt" -ge "$max" ]; then
-            log "  FAIL  $label ($host:$port) - unreachable after $max attempts${LAST_TCP_ERROR:+: $LAST_TCP_ERROR}"
-            return 1
-        fi
-        log "  ...   $label ($host:$port) unreachable${LAST_TCP_ERROR:+ ($LAST_TCP_ERROR)}, retrying in ${delay}s (attempt $((attempt + 1))/$max)"
-        sleep "$delay"
-        attempt=$((attempt + 1))
-        delay=$((delay * 2))
-    done
-}
+# check_tcp / check_connectivity live in lib/connectivity.sh (shared with
+# deploy-aws.sh).
 
 parse_registry_host() {
     local ref="$1" first_segment="${1%%/*}"
@@ -267,7 +321,6 @@ step_preflight() {
         echo "Error: deploy-local.sh only supports Linux (bare metal or VM)." >&2
         exit 1
     fi
-    require_cmd openssl
 
     local mem_kb mem_gb cpu_count disk_avail_gb
     mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
@@ -324,62 +377,6 @@ step_preflight() {
     state_mark_done "preflight"
 }
 
-detect_pkg_manager() {
-    if command -v apt-get >/dev/null 2>&1; then echo "apt-get"
-    elif command -v dnf >/dev/null 2>&1; then echo "dnf"
-    elif command -v yum >/dev/null 2>&1; then echo "yum"
-    elif command -v zypper >/dev/null 2>&1; then echo "zypper"
-    fi
-}
-
-# Rootless Docker's own installer (get.docker.com/rootless) needs iptables and
-# newuidmap/newgidmap on the host and just dies with its own error message if
-# they're missing. Detect and offer to install them first so that failure
-# doesn't happen mid-install.
-ensure_rootless_prereqs() {
-    local missing_bins=()
-    command -v iptables >/dev/null 2>&1 || missing_bins+=("iptables")
-    command -v newuidmap >/dev/null 2>&1 || missing_bins+=("newuidmap")
-    [ "${#missing_bins[@]}" -eq 0 ] && return 0
-
-    local mgr
-    mgr=$(detect_pkg_manager)
-    if [ -z "$mgr" ]; then
-        log "Warning: missing ${missing_bins[*]} and no known package manager (apt-get/dnf/yum/zypper) detected."
-        log "Install these manually before continuing if the rootless Docker install below fails."
-        return 0
-    fi
-
-    local pkgs=()
-    for bin in "${missing_bins[@]}"; do
-        case "$bin:$mgr" in
-            iptables:*) pkgs+=("iptables") ;;
-            newuidmap:apt-get) pkgs+=("uidmap") ;;
-            newuidmap:dnf|newuidmap:yum) pkgs+=("shadow-utils") ;;
-            newuidmap:zypper) pkgs+=("shadow") ;;
-        esac
-    done
-
-    local install_cmd
-    case "$mgr" in
-        apt-get) install_cmd="sudo apt-get update && sudo apt-get install -y ${pkgs[*]}" ;;
-        dnf)     install_cmd="sudo dnf install -y ${pkgs[*]}" ;;
-        yum)     install_cmd="sudo yum install -y ${pkgs[*]}" ;;
-        zypper)  install_cmd="sudo zypper install -y ${pkgs[*]}" ;;
-    esac
-
-    log "Rootless Docker needs: ${missing_bins[*]} (missing). Package(s) to install via $mgr: ${pkgs[*]}"
-    if ! $NONINTERACTIVE; then
-        read -r -p "Install rootless Docker prerequisites (${pkgs[*]}) via sudo $mgr now? [y/N]: " CONFIRM
-        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: rootless Docker cannot install without ${missing_bins[*]}."; exit 1; }
-    fi
-    if $DRY_RUN; then
-        echo "[dry-run] would run: $install_cmd"
-    else
-        eval "$install_cmd"
-    fi
-}
-
 step_docker_install() {
     if step_done "docker_install" && ! $FRESH; then log "docker_install: already done, skipping"; return; fi
 
@@ -398,7 +395,8 @@ step_docker_install() {
             read -r -p "Docker/compose not found. Install rootless Docker now? [y/N]: " CONFIRM
             [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: Docker is required (or re-run with --skip-docker-install once installed)."; exit 1; }
         fi
-        ensure_rootless_prereqs
+        ensure_installed "rootless Docker" iptables newuidmap
+        ensure_kernel_module nf_tables
 
         if $DRY_RUN; then
             echo "[dry-run] would run: curl -fsSL https://get.docker.com/rootless | sh"
@@ -508,12 +506,12 @@ step_generate_env() {
 
     if [ -z "${SIGNING_KEY:-}" ]; then
         if $NONINTERACTIVE; then
-            SIGNING_KEY=$(openssl rand -hex 16)
+            SIGNING_KEY=$(random_hex 16)
             log "Generated SIGNING_KEY"
         else
             read -r -p "Signing Key (leave blank to auto-generate): " SIGNING_KEY
             if [ -z "$SIGNING_KEY" ]; then
-                SIGNING_KEY=$(openssl rand -hex 16)
+                SIGNING_KEY=$(random_hex 16)
                 log "Generated SIGNING_KEY"
             fi
         fi

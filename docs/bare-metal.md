@@ -22,15 +22,22 @@ box for testing. For AWS (Lambda + API Gateway via CloudFormation), see
   block one or more of them), reports every blocked endpoint together rather
   than stopping at the first, and prints the exact reason (DNS failure,
   connection refused, timeout, ...) for each one that's unreachable.
-- `curl`, `jq`, `openssl` (the installer checks for these and tells you if
-  one is missing).
-- Root/sudo access may be needed, but only briefly and only for two things:
-  installing Docker's own rootless-mode prerequisites (`iptables`,
-  `uidmap`/`shadow-utils`/`shadow`, depending on your package manager) if
-  they're not already on the box - the installer detects what's missing via
-  `apt-get`/`dnf`/`yum`/`zypper` and asks before running anything - and, if
-  you choose managed SSL on a rootless Docker setup, binding ports 80/443
-  (see below).
+- `curl` and `jq`. Not installed? No action needed - the installer detects
+  what's missing, works out the right package for your `apt-get`/`dnf`/
+  `yum`/`zypper`, and asks before installing anything via sudo. (`openssl`
+  is *not* required - it's not used for SSL/TLS at all here, since certbot
+  runs inside the nginx container; the only place it was used on the host
+  was to generate a random `SIGNING_KEY`, which now comes straight from
+  `/dev/urandom` instead.)
+- Root/sudo access may be needed, but only briefly, for: installing `curl`/
+  `jq` if missing (above), installing Docker's own rootless-mode
+  prerequisites (`iptables`, `uidmap`/`shadow-utils`/`shadow`, depending on
+  your package manager) if they're not already on the box, loading the
+  `nf_tables` kernel module if it isn't already loaded (common on minimal
+  images like Amazon Linux 2023, where rootless Docker's own setup script
+  refuses to proceed without it even after `iptables-nft` is installed) -
+  same detect-and-ask flow - and, if you choose managed SSL on a rootless
+  Docker setup, binding ports 80/443 (see below).
 - If you already manage Docker yourself (Ansible, Chef, golden image, ...),
   pass `--skip-docker-install` and the script will just verify it's present.
 
