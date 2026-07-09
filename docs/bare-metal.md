@@ -13,15 +13,19 @@ box for testing. For AWS (Lambda + API Gateway via CloudFormation), see
 - Outbound HTTPS (443) access to: `www.eka.care`, `api.eka.care` (webhook
   auth/registration), the app image's Docker registry (Docker Hub by default,
   or your own private registry if using `--image`), `get.docker.com` (unless
-  Docker is already installed or you pass `--skip-docker-install`), and - if
-  you want managed SSL - Docker Hub as well (nginx/certbot images always come
-  from there, even if `--image` points the app at a private registry), Let's
-  Encrypt, and (best-effort, non-blocking) `checkip.amazonaws.com` for the DNS
-  sanity check. The installer checks every required one of these during
-  preflight, retrying with backoff before failing (client firewalls commonly
-  block one or more of them), reports every blocked endpoint together rather
-  than stopping at the first, and prints the exact reason (DNS failure,
-  connection refused, timeout, ...) for each one that's unreachable.
+  Docker is already installed or you pass `--skip-docker-install`), `github.com`
+  and `objects.githubusercontent.com` (Docker Compose CLI plugin download -
+  `get.docker.com/rootless` installs the Docker engine itself but not this,
+  so it's fetched separately whenever `docker compose` isn't already working),
+  and - if you want managed SSL - Docker Hub as well (nginx/certbot images
+  always come from there, even if `--image` points the app at a private
+  registry), Let's Encrypt, and (best-effort, non-blocking)
+  `checkip.amazonaws.com` for the DNS sanity check. The installer checks every
+  required one of these during preflight, retrying with backoff before
+  failing (client firewalls commonly block one or more of them), reports
+  every blocked endpoint together rather than stopping at the first, and
+  prints the exact reason (DNS failure, connection refused, timeout, ...) for
+  each one that's unreachable.
 - `curl` and `jq`. Not installed? No action needed - the installer detects
   what's missing, works out the right package for your `apt-get`/`dnf`/
   `yum`/`zypper`, and asks before installing anything via sudo. (`openssl`

@@ -180,6 +180,44 @@ ensure_clean_rootless_install() {
     fi
 }
 
+# get.docker.com/rootless installs core Docker (dockerd/docker/containerd/runc)
+# but NOT the Compose CLI plugin - "docker compose" comes back as "unknown
+# command" until this is installed separately, regardless of whether Docker
+# itself was just freshly installed or was already present on the box.
+# No-ops with zero prompts if it's already working.
+ensure_compose_plugin() {
+    docker compose version >/dev/null 2>&1 && return 0
+
+    log "Docker Compose CLI plugin not found ('docker compose' is unrecognized)."
+    if ! $NONINTERACTIVE; then
+        read -r -p "Download and install it now (to ~/.docker/cli-plugins/docker-compose)? [y/N]: " CONFIRM
+        [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: the Docker Compose plugin is required."; exit 1; }
+    fi
+
+    local arch compose_url
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" ;;
+        aarch64) compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-aarch64" ;;
+        *) echo "Error: no known Docker Compose plugin build for architecture '$arch'. Install it manually: https://docs.docker.com/compose/install/linux/#install-the-plugin-manually" >&2; exit 1 ;;
+    esac
+
+    if $DRY_RUN; then
+        echo "[dry-run] would run: mkdir -p ~/.docker/cli-plugins && curl -fsSL $compose_url -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose"
+    else
+        mkdir -p "$HOME/.docker/cli-plugins"
+        curl -fsSL "$compose_url" -o "$HOME/.docker/cli-plugins/docker-compose" || {
+            echo "Error: failed to download the Docker Compose plugin from $compose_url" >&2
+            exit 1
+        }
+        chmod +x "$HOME/.docker/cli-plugins/docker-compose"
+        docker compose version >/dev/null 2>&1 || {
+            echo "Error: Docker Compose plugin installed but 'docker compose version' still fails." >&2
+            exit 1
+        }
+    fi
+}
+
 # ---- CLI parsing ----------------------------------------------------------
 
 ACTION="install"
@@ -255,13 +293,30 @@ set_env_var() {
     fi
 }
 
-# ask PROMPT VARNAME DEFAULT SECRET REQUIRED
-# Skips prompting entirely if $VARNAME is already non-empty - this is what
-# makes re-runs idempotent (only missing/invalid values get re-asked).
+# ask PROMPT VARNAME DEFAULT SECRET REQUIRED CONFIRM_EXISTING
+# Skips prompting entirely if $VARNAME is already non-empty and CONFIRM_EXISTING
+# isn't set - this is what makes re-runs idempotent (only missing/invalid
+# values get re-asked). With CONFIRM_EXISTING=true, an existing value is
+# surfaced (masked if secret) and kept on a blank Enter, or replaced by typing
+# a new one - use this for values worth being visible/overridable across
+# re-runs (credentials, keys) instead of silently reusing them with zero
+# indication that a saved value exists.
 ask() {
-    local prompt="$1" varname="$2" default="${3:-}" secret="${4:-false}" required="${5:-false}"
+    local prompt="$1" varname="$2" default="${3:-}" secret="${4:-false}" required="${5:-false}" confirm_existing="${6:-false}"
     local current="${!varname:-}"
-    if [ -n "$current" ]; then return 0; fi
+
+    if [ -n "$current" ]; then
+        if [ "$confirm_existing" != "true" ] || $NONINTERACTIVE; then return 0; fi
+        local shown="$current" answer
+        if [ "$secret" == "true" ]; then
+            shown="(hidden)"
+            read -r -s -p "$prompt [existing: $shown, Enter to keep]: " answer; echo
+        else
+            read -r -p "$prompt [existing: $shown, Enter to keep]: " answer
+        fi
+        [ -n "$answer" ] && printf -v "$varname" '%s' "$answer"
+        return 0
+    fi
 
     if $NONINTERACTIVE; then
         if [ -n "$default" ]; then printf -v "$varname" '%s' "$default"; return 0; fi
@@ -373,8 +428,18 @@ step_preflight() {
     registry_host=$(parse_registry_host "${CLI_IMAGE:-registry-1.docker.io/library/python}")
     check_connectivity "$registry_host" 443 "Docker registry (app image)" || conn_failed=1
 
-    if ! $SKIP_DOCKER_INSTALL && ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1); then
-        check_connectivity "get.docker.com" 443 "Docker install script" || conn_failed=1
+    if ! $SKIP_DOCKER_INSTALL; then
+        if ! command -v docker >/dev/null 2>&1; then
+            check_connectivity "get.docker.com" 443 "Docker install script" || conn_failed=1
+        fi
+        if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1); then
+            # get.docker.com/rootless doesn't bundle the Compose plugin -
+            # ensure_compose_plugin() downloads it from a GitHub release,
+            # which redirects to a different CDN host, so both need to be
+            # reachable, not just github.com itself.
+            check_connectivity "github.com" 443 "Docker Compose plugin download" || conn_failed=1
+            check_connectivity "objects.githubusercontent.com" 443 "Docker Compose plugin download (redirect target)" || conn_failed=1
+        fi
     fi
 
     local known_ssl_mode="${CLI_SSL_MODE:-$SSL_MODE}"
@@ -403,7 +468,13 @@ step_preflight() {
 }
 
 step_docker_install() {
-    if step_done "docker_install" && ! $FRESH; then log "docker_install: already done, skipping"; return; fi
+    if step_done "docker_install" && ! $FRESH; then
+        if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+            log "docker_install: already done, skipping"
+            return
+        fi
+        log "docker_install: marked done previously, but Docker/Compose isn't fully working now - rechecking"
+    fi
 
     if $SKIP_DOCKER_INSTALL; then
         log "docker_install: --skip-docker-install given, verifying docker is present"
@@ -413,11 +484,11 @@ step_docker_install() {
         return
     fi
 
-    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-        log "Docker + compose already installed"
+    if command -v docker >/dev/null 2>&1; then
+        log "Docker already installed"
     else
         if ! $NONINTERACTIVE; then
-            read -r -p "Docker/compose not found. Install rootless Docker now? [y/N]: " CONFIRM
+            read -r -p "Docker not found. Install rootless Docker now? [y/N]: " CONFIRM
             [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborting: Docker is required (or re-run with --skip-docker-install once installed)."; exit 1; }
         fi
         ensure_installed "rootless Docker" iptables newuidmap
@@ -449,6 +520,8 @@ step_docker_install() {
             export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
         fi
     fi
+
+    ensure_compose_plugin
 
     state_mark_done "docker_install"
 }
@@ -542,15 +615,15 @@ step_generate_env() {
     set_env_var "$CONFIG_FILE" CLIENT_NAME "$CLIENT_NAME"
 
     [ "${CLIENT_ID:-}" == "YOUR_CLIENT_ID" ] && CLIENT_ID=""
-    ask "Client ID" CLIENT_ID "" false true
+    ask "Client ID" CLIENT_ID "" false true true
     set_env_var "$CONFIG_FILE" CLIENT_ID "$CLIENT_ID"
 
     [ "${CLIENT_SECRET:-}" == "YOUR_CLIENT_SECRET" ] && CLIENT_SECRET=""
-    ask "Client Secret" CLIENT_SECRET "" true true
+    ask "Client Secret" CLIENT_SECRET "" true true true
     set_env_var "$CONFIG_FILE" CLIENT_SECRET "$CLIENT_SECRET"
 
     [ "${API_KEY:-}" == "YOUR_API_KEY" ] && API_KEY=""
-    ask "API Key" API_KEY "" true true
+    ask "API Key" API_KEY "" true true true
     set_env_var "$CONFIG_FILE" API_KEY "$API_KEY"
 
     if [ -z "${SIGNING_KEY:-}" ]; then
@@ -564,20 +637,24 @@ step_generate_env() {
                 log "Generated SIGNING_KEY"
             fi
         fi
+    elif ! $NONINTERACTIVE; then
+        local new_signing_key
+        read -r -p "Signing Key [existing: (hidden), Enter to keep]: " new_signing_key
+        [ -n "$new_signing_key" ] && SIGNING_KEY="$new_signing_key"
     fi
     set_env_var "$CONFIG_FILE" SIGNING_KEY "$SIGNING_KEY"
 
     if [ "$CLIENT_NAME" == "metropolis" ]; then
         [ "${YELLOW_AI_API_KEY:-}" == "YOUR_YELLOW_AI_API_KEY" ] && YELLOW_AI_API_KEY=""
-        ask "Yellow.ai API Key" YELLOW_AI_API_KEY "" true false
+        ask "Yellow.ai API Key (optional, Enter to skip)" YELLOW_AI_API_KEY "" true false true
         set_env_var "$CONFIG_FILE" YELLOW_AI_API_KEY "$YELLOW_AI_API_KEY"
 
         [ "${JAPI_KEY:-}" == "YOUR_JAPI_KEY" ] && JAPI_KEY=""
-        ask "JAPI Key" JAPI_KEY "" true false
+        ask "JAPI Key (optional, Enter to skip)" JAPI_KEY "" true false true
         set_env_var "$CONFIG_FILE" JAPI_KEY "$JAPI_KEY"
 
         [ "${JAPI_AUTHORIZATION:-}" == "YOUR_JAPI_AUTHORIZATION" ] && JAPI_AUTHORIZATION=""
-        ask "JAPI Authorization" JAPI_AUTHORIZATION "" true false
+        ask "JAPI Authorization (optional, Enter to skip)" JAPI_AUTHORIZATION "" true false true
         set_env_var "$CONFIG_FILE" JAPI_AUTHORIZATION "$JAPI_AUTHORIZATION"
     fi
 
