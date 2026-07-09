@@ -11,6 +11,20 @@ CONFIG_FILE="$SCRIPT_DIR/config.env"
 STATE_DIR="$HOME/.eka-deploy"
 STATE_FILE="$STATE_DIR/state.json"
 
+# get.docker.com/rootless always installs to ~/bin, and sets it as the
+# default CLI context so DOCKER_HOST isn't strictly required for routing -
+# but this script itself is a non-interactive shell (invoked as
+# ./deploy-local.sh), so it never sources ~/.bashrc the way an interactive
+# login shell does. A previously-installed rootless Docker would otherwise
+# look "not found" here (command -v only checks $PATH as inherited from the
+# invoking shell) even though it's fine - so check the well-known install
+# location directly rather than trusting whatever PATH we happened to
+# inherit.
+[ -d "$HOME/bin" ] && PATH="$HOME/bin:$PATH"
+if [ -z "${DOCKER_HOST:-}" ] && [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock" ]; then
+    export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+fi
+
 # shellcheck source=lib/register-webhook.sh
 source "$SCRIPT_DIR/lib/register-webhook.sh"
 # shellcheck source=lib/connectivity.sh
