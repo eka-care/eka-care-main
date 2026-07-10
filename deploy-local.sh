@@ -61,12 +61,41 @@ FIELDS_TO_CHANGE=""
 # step_docker_install/step_network_create (no config values live there, no
 # need to redo sudo work).
 RECONFIGURE=false
+# Space-separated, UPPERCASE list of every field name ask() (or the
+# hand-rolled SIGNING_KEY prompt) actually evaluated against FIELDS_TO_CHANGE
+# this run. Used to catch a field named in "which fields do you want to
+# change" that no prompt ever consults - e.g. HTTP_PORT/HTTPS_PORT only get
+# asked about inside the SSL_MODE=managed branch of step_ssl_setup, so
+# naming HTTP_PORT while SSL_MODE=external would otherwise silently do
+# nothing with zero feedback. See warn_unmatched_fields_to_change().
+KNOWN_ASK_FIELDS=""
 
 field_should_prompt() {
     case " $FIELDS_TO_CHANGE " in
         *" $1 "*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Called after every step that could have consulted FIELDS_TO_CHANGE has run.
+# Warns (doesn't fail - the run already completed) about any named field
+# that no ask() call - and no other config prompt - actually looked at, so a
+# typo or a field that's conditionally irrelevant (e.g. HTTP_PORT while
+# SSL_MODE=external) is surfaced instead of silently doing nothing.
+warn_unmatched_fields_to_change() {
+    [ -n "$FIELDS_TO_CHANGE" ] || return 0
+    local field unmatched=()
+    for field in $FIELDS_TO_CHANGE; do
+        case " $KNOWN_ASK_FIELDS " in
+            *" $field "*) ;;
+            *) unmatched+=("$field") ;;
+        esac
+    done
+    [ "${#unmatched[@]}" -eq 0 ] && return 0
+    log "Warning: requested field(s) were never prompted this run: ${unmatched[*]}"
+    log "  Either the name doesn't match a real config.env field, or it only applies under different settings"
+    log "  (e.g. HTTP_PORT/HTTPS_PORT only prompt when SSL_MODE=managed). Edit config.env directly if needed,"
+    log "  then re-run install to validate."
 }
 CLI_PORT=""
 CLI_EXTERNAL_URL=""
@@ -527,6 +556,7 @@ set_env_var() {
 ask() {
     local prompt="$1" varname="$2" default="${3:-}" secret="${4:-false}" required="${5:-false}" confirm_existing="${6:-false}"
     local current="${!varname:-}"
+    KNOWN_ASK_FIELDS="$KNOWN_ASK_FIELDS $varname"
 
     if [ -n "$current" ]; then
         local want_prompt=false
@@ -810,8 +840,8 @@ step_ssl_setup() {
         domain=$(echo "$EXTERNAL_URL" | sed -E 's#^https?://##' | sed -E 's#/.*$##')
         dns_sanity_check "$domain"
 
-        HTTP_PORT="${HTTP_PORT:-80}"
-        HTTPS_PORT="${HTTPS_PORT:-443}"
+        ask "HTTP port nginx publishes (Let's Encrypt's challenge always connects on 80 - only change this if something else forwards 80 to it)" HTTP_PORT "${HTTP_PORT:-80}" false true true
+        ask "HTTPS port nginx publishes" HTTPS_PORT "${HTTPS_PORT:-443}" false true true
         set_env_var "$CONFIG_FILE" HTTP_PORT "$HTTP_PORT"
         set_env_var "$CONFIG_FILE" HTTPS_PORT "$HTTPS_PORT"
         if [ "$HTTP_PORT" != "80" ]; then
@@ -863,6 +893,7 @@ step_generate_env() {
     ask "API Key" API_KEY "" true true true
     set_env_var "$CONFIG_FILE" API_KEY "$API_KEY"
 
+    KNOWN_ASK_FIELDS="$KNOWN_ASK_FIELDS SIGNING_KEY"
     if [ -z "${SIGNING_KEY:-}" ]; then
         if $NONINTERACTIVE; then
             SIGNING_KEY=$(random_hex 16)
@@ -1228,6 +1259,7 @@ cmd_install() {
     step_network_create
     step_ssl_setup
     step_generate_env
+    warn_unmatched_fields_to_change
     step_config_validate
     step_build_and_start
     step_ssl_cert

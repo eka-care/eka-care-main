@@ -8,7 +8,7 @@
 #     (SSL_MODE=managed) so the app is never reachable except through nginx.
 
 services:
-  app:
+  webhook-app:
     build:
       context: .
       dockerfile: Dockerfile
