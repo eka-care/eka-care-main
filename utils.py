@@ -104,7 +104,7 @@ def enrich_params(template_name, message_data):
         params_data[str(cnt)] = message_data[param]
 
     for param in template_name_to_params[template_name].get("media_params", []):
-        params_data["media"] = {"filename": param, "mediaLink": message_data[param]}
+        params_data["media"] = {"filename": "Prescription", "mediaLink": message_data[param]}
 
     return params_data
 
