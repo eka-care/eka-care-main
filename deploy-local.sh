@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.env"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 STATE_DIR="$HOME/.eka-deploy"
 STATE_FILE="$STATE_DIR/state.json"
 
@@ -59,6 +60,7 @@ CLI_EXTERNAL_URL=""
 CLI_SSL_MODE=""
 CLI_IMAGE=""
 CLI_ENV_FILE=""
+CLI_COMPOSE_FILE=""
 
 SSL_MODE=""
 PORT=""
@@ -90,6 +92,8 @@ Options:
                               the block is automatically uncommented again.
   --env-file PATH            Path to the env file (default: config.env,
                               materialized from config.env.example if missing)
+  --docker-compose-file PATH Path to the compose file (default: docker-compose.yml
+                              in the script directory)
   --port PORT
   --external-url URL
   --ssl-mode managed|external
@@ -377,23 +381,23 @@ persist_rootless_docker_env() {
 # a previous --skip-nginx run.
 NGINX_BLOCK_SKIP_MARKER="#EKA-SKIP-NGINX# "
 apply_skip_nginx() {
-    local compose_file="$SCRIPT_DIR/docker-compose.yml"
+    local compose_file="$COMPOSE_FILE"
     local start_line end_line
     start_line=$(grep -n '^[[:space:]]*# eka-nginx-block:start' "$compose_file" | head -1 | cut -d: -f1)
     end_line=$(grep -n '^[[:space:]]*# eka-nginx-block:end' "$compose_file" | head -1 | cut -d: -f1)
     if [ -z "$start_line" ] || [ -z "$end_line" ] || [ "$start_line" -ge "$end_line" ]; then
-        log "Warning: couldn't find the eka-nginx-block markers in docker-compose.yml (has it been edited manually?) - skipping the --skip-nginx toggle and using the file as-is."
+        log "Warning: couldn't find the eka-nginx-block markers in $(basename "$compose_file") (has it been edited manually?) - skipping the --skip-nginx toggle and using the file as-is."
         if $SKIP_NGINX; then
-            log "Note: --skip-nginx was requested but not applied to docker-compose.yml itself. SSL_MODE is still forced to 'external', so nginx/certbot won't be started regardless - but the compose file's own nginx/certbot definitions are untouched."
+            log "Note: --skip-nginx was requested but not applied to $(basename "$compose_file") itself. SSL_MODE is still forced to 'external', so nginx/certbot won't be started regardless - but the compose file's own nginx/certbot definitions are untouched."
         fi
         return 0
     fi
 
     if $DRY_RUN; then
         if $SKIP_NGINX; then
-            echo "[dry-run] would comment out the nginx/certbot block in docker-compose.yml"
+            echo "[dry-run] would comment out the nginx/certbot block in $(basename "$compose_file")"
         else
-            echo "[dry-run] would ensure the nginx/certbot block in docker-compose.yml is uncommented"
+            echo "[dry-run] would ensure the nginx/certbot block in $(basename "$compose_file") is uncommented"
         fi
         return 0
     fi
@@ -432,6 +436,7 @@ while [[ $# -gt 0 ]]; do
         --skip-docker-install) SKIP_DOCKER_INSTALL=true; shift ;;
         --skip-nginx) SKIP_NGINX=true; shift ;;
         --env-file) CLI_ENV_FILE="$2"; shift 2 ;;
+        --docker-compose-file) CLI_COMPOSE_FILE="$2"; shift 2 ;;
         --port) CLI_PORT="$2"; shift 2 ;;
         --external-url) CLI_EXTERNAL_URL="$2"; shift 2 ;;
         --ssl-mode) CLI_SSL_MODE="$2"; shift 2 ;;
@@ -443,6 +448,7 @@ done
 
 [ "$ACTION" == "help" ] && { usage; exit 0; }
 [ -n "$CLI_ENV_FILE" ] && CONFIG_FILE="$CLI_ENV_FILE"
+[ -n "$CLI_COMPOSE_FILE" ] && COMPOSE_FILE="$CLI_COMPOSE_FILE"
 
 if $SKIP_NGINX; then
     if [ "$CLI_SSL_MODE" == "managed" ]; then
@@ -588,7 +594,7 @@ dns_sanity_check() {
 # `config` always runs for real - it only renders/validates, never mutates.
 
 compose() {
-    local args=(-f "$SCRIPT_DIR/docker-compose.yml")
+    local args=(-f "$COMPOSE_FILE")
     if [ "$SSL_MODE" == "managed" ]; then
         args+=(--profile ssl)
         export APP_BIND_ADDR="127.0.0.1"
@@ -961,7 +967,7 @@ step_ssl_cert() {
             < "$SCRIPT_DIR/nginx/nginx-https.conf.example" > "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf"
         if ! compose exec nginx nginx -s reload; then
             log "Warning: certificate issued, but nginx failed to reload it. Reload manually:"
-            log "  docker compose --env-file $CONFIG_FILE -f $SCRIPT_DIR/docker-compose.yml --profile ssl exec nginx nginx -s reload"
+            log "  docker compose --env-file $CONFIG_FILE -f $COMPOSE_FILE --profile ssl exec nginx nginx -s reload"
         fi
         state_mark_done "ssl_cert"
         log "Certificate issued - $EXTERNAL_URL is now served over HTTPS."
@@ -1058,7 +1064,7 @@ step_finalize() {
     echo "  Config file:  $CONFIG_FILE"
     local profile_flag=""
     [ "$SSL_MODE" == "managed" ] && profile_flag="--profile ssl "
-    echo "  View logs:    $0 status   (or) docker compose --env-file $CONFIG_FILE -f docker-compose.yml ${profile_flag}logs -f app"
+    echo "  View logs:    $0 status   (or) docker compose --env-file $CONFIG_FILE -f $COMPOSE_FILE ${profile_flag}logs -f app"
     echo "  Upgrade:      $0 upgrade [--image <ref>]"
     echo "  Uninstall:    $0 uninstall"
 }
@@ -1091,7 +1097,7 @@ verify_setup() {
     log "Verifying installer files and configuration..."
     local missing=0 f
     local required_files=(
-        "$SCRIPT_DIR/docker-compose.yml"
+        "$COMPOSE_FILE"
         "$SCRIPT_DIR/Dockerfile"
         "$SCRIPT_DIR/nginx/nginx.conf.example"
         "$SCRIPT_DIR/nginx/nginx-https.conf.example"
@@ -1127,9 +1133,9 @@ verify_setup() {
         local err_log
         err_log=$(mktemp)
         if compose config -q 2>"$err_log"; then
-            log "  OK       docker-compose.yml + $(basename "$CONFIG_FILE") render correctly"
+            log "  OK       $(basename "$COMPOSE_FILE") + $(basename "$CONFIG_FILE") render correctly"
         else
-            echo "Error: docker-compose.yml / $(basename "$CONFIG_FILE") failed to validate:" >&2
+            echo "Error: $(basename "$COMPOSE_FILE") / $(basename "$CONFIG_FILE") failed to validate:" >&2
             cat "$err_log" >&2
             rm -f "$err_log"
             exit 1

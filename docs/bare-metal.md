@@ -82,13 +82,16 @@ gitignored; only the placeholder `config.env.example` is tracked).
 If you'd rather hand-craft `config.env` yourself (`cp
 config.env.example config.env && vim config.env`) than
 answer prompts, that's supported directly: if the file already exists when
-you run `install`, the installer shows a summary of what's configured
-(secrets masked) and asks once whether to use it as-is. Confirm, and it
-proceeds without walking through each already-set value individually - any
-field you left blank is still prompted for (or generated, for `SIGNING_KEY`)
-as usual. This only affects config *values* - sudo confirmations for system
-changes (installing Docker, kernel modules, etc.) are unaffected and still
-asked normally.
+you run `install`, the installer shows a summary of every field currently in
+the file (secrets masked, blanks shown as `(blank)`) and asks once whether
+to use it as-is. Confirm, and it proceeds without walking through each
+already-set value individually - any field you left blank is still prompted
+for (or generated, for `SIGNING_KEY`) as usual. If you say no instead, you
+can name specific field(s) to change (e.g. `CLIENT_SECRET API_KEY`) and only
+those get re-prompted - everything else keeps its existing value, so
+changing 2-3 fields never means walking the whole file. This only affects
+config *values* - sudo confirmations for system changes (installing Docker,
+kernel modules, etc.) are unaffected and still asked normally.
 
 | Variable | Meaning |
 |---|---|
@@ -124,6 +127,39 @@ publicly reachable via the `APP_BIND_ADDR` environment variable.
   the installer does a non-blocking sanity check for this before attempting
   issuance.
 
+SSL is never mandatory for the app to actually run. If certificate issuance
+fails (almost always because DNS for `EXTERNAL_URL` isn't pointing at this
+host yet), the installer asks whether to keep running over plain HTTP for
+now and prints the exact steps to enable HTTPS later; a plain re-run of
+`install` (no `--fresh` needed) retries only the certificate step once DNS
+is fixed.
+
+### `--skip-nginx`
+
+If you don't want nginx/certbot involved at all - your own reverse proxy
+handles TLS higher up, or you just want the bare app - pass `--skip-nginx`.
+This:
+
+- Forces `SSL_MODE=external` (conflicts with `--ssl-mode managed` - the
+  installer errors if both are given).
+- Physically comments out the entire nginx + certbot block in
+  `docker-compose.yml` (or whatever file `--docker-compose-file` points at),
+  between the `# eka-nginx-block:start`/`:end` markers, using a
+  line-prefixed marker so it's byte-for-byte reversible. Omit the flag on a
+  later run and the block is automatically uncommented again.
+
+Because `SSL_MODE=external` also means the `ssl` Compose profile is never
+activated, **certbot is skipped along with nginx** - not just left commented
+out in the file, but never started even if it were still present (the
+`ssl_cert` step itself is a no-op unless `SSL_MODE=managed`). You don't get
+one without the other from this flag.
+
+If the compose file has no nginx/certbot service at all (a fully custom
+file passed via `--docker-compose-file`), the marker-based comment step is
+skipped with a warning - there's nothing to comment out - but `SSL_MODE` is
+still forced to `external` and the `ssl` profile still never activates, so
+the net effect (no nginx, no certbot) is the same either way.
+
 nginx configuration lives in `nginx/`:
 - `nginx.conf.example` - always active; serves the ACME challenge and
   proxies to the app on port 80. Rendered (envsubst, domain/port filled in)
@@ -152,7 +188,12 @@ Both rendered files are gitignored (installer-generated, host-specific).
 Useful flags on `install`/`upgrade`: `--fresh` (ignore saved step state),
 `--debug` (verbose), `--non-interactive` (fail instead of prompting - use
 with everything pre-filled in `config.env`), `--port`,
-`--external-url`, `--ssl-mode managed|external`, `--skip-docker-install`.
+`--external-url`, `--ssl-mode managed|external`, `--skip-docker-install`,
+`--env-file PATH` (use a `config.env` at a non-default location),
+`--docker-compose-file PATH` (use a `docker-compose.yml` at a non-default
+location - the installer reads/writes/toggles that file instead of the one
+in the script directory; `--skip-nginx`'s nginx/certbot toggle, below,
+operates on whichever file this points at), `--skip-nginx` (see below).
 
 Every `[y/N]` confirmation during install (installing missing packages,
 loading kernel modules, sudo steps, etc.) also accepts `a`/`A` - "yes to
@@ -166,7 +207,8 @@ don't need to type `y` a dozen separate times on a fresh host.
   in it - just which steps are done, for idempotent resume).
 - Container logs: `./deploy-local.sh status`, or directly:
   `docker compose --env-file config.env -f docker-compose.yml
-  [--profile ssl] logs -f app`
+  [--profile ssl] logs -f app` (swap in your `--env-file`/
+  `--docker-compose-file` paths if you used non-default ones)
 - Log rotation is handled by Docker's `json-file` driver (10MB x 5 files per
   container) - no host-level logrotate setup needed.
 
@@ -180,5 +222,7 @@ don't need to type `y` a dozen separate times on a fresh host.
   yet), then re-run `./deploy-local.sh register-webhook` - no need to redo
   the whole install.
 - **Certbot issuance fails**: almost always DNS not pointing at this host
-  yet. Fix DNS, then re-run `install` (it picks up from the `build_and_start`
-  step since earlier steps are already marked done).
+  yet. The installer already offers to keep running over plain HTTP when
+  this happens - fix DNS, then re-run `install` (it retries only the
+  certificate step; everything else stays marked done). Don't need managed
+  SSL at all? Use `--skip-nginx` instead to drop nginx/certbot entirely.
