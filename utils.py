@@ -1,8 +1,20 @@
 import importlib
+import logging
+import os
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from template_configs import *
 from config_loader import load_client_config
+
+load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / "config.env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+logger = logging.getLogger(__name__)
 
 
 def get_integration_module(client_config=None):
@@ -140,6 +152,17 @@ def get_message_data(event_data, client_config=None):
     px_url = appointment_details.get("prescription_url", "")
     pt_mobile = patient_details.get("mobile") or ""
     pt_mobile = pt_mobile[-10:]
+    partner_patient_id = (
+        event_data.get("partner_patient_id")
+        or event_data.get("partnerPatientId")
+        or event_data.get("patient_id")
+        or event_data.get("patientId")
+        or appointment_details.get("partner_patient_id")
+        or appointment_details.get("partnerPatientId")
+        or appointment_details.get("patient_id")
+        or appointment_details.get("patientId")
+        or ""
+    )
     pt_first_name = patient_details.get("first_name")
     pt_last_name = patient_details.get("last_name")
     pt_name = pt_first_name
@@ -167,8 +190,75 @@ def get_message_data(event_data, client_config=None):
         "appointment_date_str": appointment_date_str,
         "appointment_time_str": appointment_time_str,
         "client_name": client_config.get("name", "metropolis"),
+        "partner_patient_id": partner_patient_id,
     }
     return message_data
+
+
+@contextmanager
+def get_mssql_connection():
+    try:
+        import pyodbc
+    except ImportError:
+        logger.warning("pyodbc is not installed; skipping MSSQL lookup")
+        yield None
+        return
+
+    host = os.getenv("DB_HOST")
+    user = os.getenv("DB_USER")
+    database = os.getenv("DB_NAME")
+    port = os.getenv("DB_PORT")
+    password = os.getenv("DB_PASSWORD")
+
+    if not all([host, user, database, port, password]):
+        logger.warning("Missing one or more MSSQL environment variables; skipping DB lookup")
+        yield None
+        return
+
+    connection = None
+    try:
+        connection_string = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={host},{port};"
+            f"DATABASE={database};"
+            f"UID={user};"
+            f"PWD={password};"
+            "TrustServerCertificate=yes"
+        )
+        connection = pyodbc.connect(connection_string, timeout=5)
+        yield connection
+    except Exception as exc:
+        logger.exception("Failed to connect to MSSQL: %s", exc)
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def get_patient_mobile_number_from_db(partner_patient_id):
+    if not partner_patient_id:
+        return None
+
+    with get_mssql_connection() as connection:
+        if not connection:
+            return None
+
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT MobileNo, PhoneHome FROM Registration WHERE RegistrationNo = ?",
+                str(partner_patient_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            return (row[0] or "").strip() or (row[1] or "").strip()
+        except Exception as exc:
+            logger.exception("Failed to fetch patient mobile from MSSQL: %s", exc)
+            return None
+        finally:
+            cursor.close()
 
 
 def send_wa_message(template_name, message_data, client_config=None):
@@ -187,6 +277,13 @@ def send_wa_message(template_name, message_data, client_config=None):
     dr_mobile = message_data["dr_mobile"]
     pt_mobile = message_data["pt_mobile"]
     mobile = dr_mobile if recipient_type == "doctor" else pt_mobile
+    if recipient_type != "doctor":
+        partner_patient_id = message_data.get("partner_patient_id") or ""
+        if partner_patient_id:
+            db_mobile = get_patient_mobile_number_from_db(partner_patient_id)
+            if db_mobile:
+                mobile = db_mobile
+
     template_payload = {
         "userDetails": {"number": mobile},
         "notification": {

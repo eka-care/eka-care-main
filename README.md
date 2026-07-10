@@ -37,7 +37,7 @@ The SDK supports signature verification to ensure webhook security, controlled i
 import os
 
 # Set to True if you want to implement signature verification
-IS_SIGNING_KEY_IMPLEMENTED = True
+IS_SIGNING_KEY_IMPLEMENTED = False
 
 # Provide signing key here
 SIGNING_KEY = os.getenv("SIGNING_KEY")

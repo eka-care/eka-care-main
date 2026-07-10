@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from config_loader import load_client_config
 from template_configs import (
@@ -6,7 +7,7 @@ from template_configs import (
     EKA_WA_NEW_APPOINTMENT_DR_MESSAGE,
     SMS_INCLINIC_MSG,
 )
-from utils import get_templates_by_data, get_integration_module
+from utils import get_templates_by_data, get_integration_module, send_wa_message
 from miracles.integration import build_miracles_payload
 
 
@@ -60,6 +61,30 @@ class ClientConfigTests(unittest.TestCase):
             built_payload["message"]["content"]["mediaTemplate"]["bodyParameterValues"]["0"],
             "Dr. Jane",
         )
+
+    def test_send_wa_message_uses_mobile_from_db_lookup(self):
+        captured_payload = {}
+
+        class DummyIntegration:
+            def send_wa_msg(self, payload):
+                captured_payload["payload"] = payload
+
+        message_data = {
+            "dr_mobile": "1111111111",
+            "pt_mobile": "2222222222",
+            "partner_patient_id": "ABC123",
+        }
+        client_config = {
+            "name": "metropolis",
+            "channels": {"whatsapp": {"enabled": True, "provider": "yellow_ai"}},
+        }
+
+        with patch("utils.get_integration_module", return_value=DummyIntegration()), patch(
+            "utils.get_patient_mobile_number_from_db", return_value="9876543210"
+        ):
+            send_wa_message("template", message_data, client_config)
+
+        self.assertEqual(captured_payload["payload"]["userDetails"]["number"], "9876543210")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ load_dotenv()
 
 SIGNING_KEY = os.getenv("SIGNING_KEY")
 
-IS_SIGNING_KEY_IMPLEMENTED = True
+IS_SIGNING_KEY_IMPLEMENTED = os.getenv("IS_SIGNING_KEY_IMPLEMENTED", "false").lower() == "true"
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 

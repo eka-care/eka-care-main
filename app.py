@@ -7,7 +7,10 @@ from constants import *
 from template_configs import event_to_api_calls
 from utils import get_templates_by_data, send_wa_message, get_message_data, send_sms
 from config_loader import load_client_config, should_process_event
+import logging
+import traceback
 
+logger = logging.getLogger(__name__)
 
 def _normalize_event_input(event):
     if event is None:
@@ -96,6 +99,7 @@ def generic_handler(event, context=None):
     print(f"event : {event}")
 
     try:
+        print(f"headers : {headers}", path, method)
         if method == "POST" and path == "/communication/webhook/v1/events":
             body = _coerce_body(payload)
             if not isinstance(body, dict):
@@ -146,12 +150,15 @@ def generic_handler(event, context=None):
 
         return {"statusCode": 404, "body": "Not Found"}
     except Exception as e:
-        print("Exception handling webhook data:", e)
+        logger.error(traceback.format_exc())
+        logger.error("Exception handling webhook data: %s", e)
         return {"statusCode": 403, "body": "Unhandled Exception"}
 
 
 class WebhookRequestHandler(BaseHTTPRequestHandler):
+    print("in WebhookRequestHandler")
     def do_POST(self):
+        print("in WebhookRequestHandler POST")
         content_length = int(self.headers.get("Content-Length", "0"))
         body_bytes = self.rfile.read(content_length) if content_length else b""
         event = {
@@ -168,6 +175,7 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(response.get("body", "").encode("utf-8"))
 
     def do_GET(self):
+        print("in WebhookRequestHandler GET")
         self.send_response(404)
         self.end_headers()
         self.wfile.write(b"Not Found")

@@ -1,5 +1,6 @@
 import os
 
+import curlify
 import requests
 
 from constants import JAPI_AUTHORIZATION, JAPI_KEY, YELLOW_AI_API_KEY
@@ -41,7 +42,7 @@ def build_miracles_payload(payload):
 
     media_template = {
         "templateId": "ekaprecription" if "prescription" in str(template_id).lower() else template_id,
-        "bodyParameterValues": _build_body_parameter_values(params),
+        "bodyParameterValues":  {},# _build_body_parameter_values(params),
     }
 
     if media_info.get("mediaLink"):
@@ -50,7 +51,7 @@ def build_miracles_payload(payload):
             "url": media_info.get("mediaLink"),
             "fileName": media_info.get("filename") or "Prescription.pdf",
         }
-
+    print(_normalize_mobile_number(payload.get("userDetails", {}).get("number")))
     return {
         "message": {
             "channel": "WABA",
@@ -60,7 +61,7 @@ def build_miracles_payload(payload):
                 "mediaTemplate": media_template,
             },
             "recipient": {
-                "to": _normalize_mobile_number(payload.get("userDetails", {}).get("number")),
+                "to": "919555499208",
                 "recipient_type": "individual",
                 "reference": {
                     "cust_ref": "cust_ref123",
@@ -87,9 +88,10 @@ def send_wa_msg(payload):
     url = "https://rcmapi.instaalerts.zone/services/rcm/sendMessage"
     headers = {
         "Content-Type": "application/json",
-        "Authentication": os.getenv("RCMAPI_API_KEY") # "Wyv7huD0i0gSMcnm33gurA==",
+        "Authentication": "Bearer " + os.getenv("RCMAPI_API_KEY") # "Wyv7huD0i0gSMcnm33gurA==",
     }
     response = requests.request("POST", url, headers=headers, json=wa_payload)
+    print(curlify.to_curl(response.request))
     response_data = response.json()
     print(response_data)
     return response_data

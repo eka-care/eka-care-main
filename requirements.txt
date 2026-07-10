@@ -1,4 +1,6 @@
+pyodbc==5.3.0
 ekacare==0.1.0
 python-dotenv==1.0.1
 PyYAML==6.0.2
 requests==2.25.0
+curlify==3.0.0
