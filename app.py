@@ -76,18 +76,27 @@ def _coerce_body(body):
     return body
 
 
+def _normalize_request_path(path):
+    if not path:
+        return "/"
+    path = str(path).split("?", 1)[0]
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    return path
+
+
 def generic_handler(event, context=None):
     payload, headers, path, method, client_name = _normalize_event_input(event)
     headers = headers or {}
     method = (method or "POST").upper()
-    path = path or "/"
+    path = _normalize_request_path(path or "/")
 
     print(f"path : {path}")
     print(f"method : {method}")
     print(f"event : {event}")
 
     try:
-        if method == "POST" and path in ["/", "/webhook"]:
+        if method == "POST" and path == "/communication/webhook/v1/events":
             body = _coerce_body(payload)
             if not isinstance(body, dict):
                 return {"statusCode": 400, "body": "Webhook body must decode to a JSON object"}
@@ -169,6 +178,9 @@ def run_server(host="0.0.0.0", port=None):
     server = HTTPServer((host, port), WebhookRequestHandler)
     print(f"Listening on http://{host}:{port}")
     server.serve_forever()
+
+
+lambda_handler = generic_handler
 
 
 if __name__ == "__main__":
