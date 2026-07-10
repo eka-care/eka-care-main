@@ -29,6 +29,8 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # eka-nginx-block:start (see --skip-nginx in deploy-local.sh - toggling
+  # that flag comments/uncomments everything between these two markers)
   # Only started when the "ssl" profile is active (SSL_MODE=managed).
   nginx:
     image: nginx:1.27-alpine
@@ -77,6 +79,7 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+  # eka-nginx-block:end
 
 volumes:
   certbot_webroot:

@@ -35,6 +35,7 @@ FRESH=false
 DEBUG=false
 NONINTERACTIVE=false
 SKIP_DOCKER_INSTALL=false
+SKIP_NGINX=false
 # Set true once the user confirms an existing config.env is fine as-is
 # (see confirm_existing_config()) - suppresses ask()'s per-field "existing:
 # ..., Enter to keep" walkthrough for already-set values, WITHOUT touching
@@ -82,6 +83,11 @@ Options:
   --debug                   Verbose output (set -x, no curl silencing)
   --non-interactive         Never prompt; fail if a required value is missing
   --skip-docker-install     Assume Docker/compose are already installed
+  --skip-nginx              Comment out nginx/certbot in docker-compose.yml
+                              entirely and force --ssl-mode external (no
+                              managed SSL, no DNS/cert requirement at all).
+                              Reversible: omit the flag on a later run and
+                              the block is automatically uncommented again.
   --env-file PATH            Path to the env file (default: config.env,
                               materialized from config.env.example if missing)
   --port PORT
@@ -361,6 +367,52 @@ persist_rootless_docker_env() {
     fi
 }
 
+# Idempotently comments out (--skip-nginx) or restores (no --skip-nginx) the
+# nginx/certbot service block in docker-compose.yml, between the
+# eka-nginx-block sentinel comments. Marks lines it comments with a unique
+# prefix so uncommenting is exact and reversible - lines that were already
+# plain comments inside the block (e.g. explanatory ones) are untouched
+# either way. Safe to call on every install/upgrade run: a run without the
+# flag always restores the block, so nothing is left in a stale state from
+# a previous --skip-nginx run.
+NGINX_BLOCK_SKIP_MARKER="#EKA-SKIP-NGINX# "
+apply_skip_nginx() {
+    local compose_file="$SCRIPT_DIR/docker-compose.yml"
+    local start_line end_line
+    start_line=$(grep -n '^[[:space:]]*# eka-nginx-block:start' "$compose_file" | head -1 | cut -d: -f1)
+    end_line=$(grep -n '^[[:space:]]*# eka-nginx-block:end' "$compose_file" | head -1 | cut -d: -f1)
+    if [ -z "$start_line" ] || [ -z "$end_line" ] || [ "$start_line" -ge "$end_line" ]; then
+        log "Warning: couldn't find the eka-nginx-block markers in docker-compose.yml (has it been edited manually?) - skipping the --skip-nginx toggle and using the file as-is."
+        if $SKIP_NGINX; then
+            log "Note: --skip-nginx was requested but not applied to docker-compose.yml itself. SSL_MODE is still forced to 'external', so nginx/certbot won't be started regardless - but the compose file's own nginx/certbot definitions are untouched."
+        fi
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        if $SKIP_NGINX; then
+            echo "[dry-run] would comment out the nginx/certbot block in docker-compose.yml"
+        else
+            echo "[dry-run] would ensure the nginx/certbot block in docker-compose.yml is uncommented"
+        fi
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    awk -v s="$start_line" -v e="$end_line" -v skip="$SKIP_NGINX" -v marker="$NGINX_BLOCK_SKIP_MARKER" '
+        NR > s && NR < e {
+            if (skip == "true") {
+                if (index($0, marker) != 1) { print marker $0; next }
+            } else {
+                if (index($0, marker) == 1) { print substr($0, length(marker) + 1); next }
+            }
+        }
+        { print }
+    ' "$compose_file" > "$tmp"
+    mv "$tmp" "$compose_file"
+}
+
 # ---- CLI parsing ----------------------------------------------------------
 
 ACTION="install"
@@ -378,6 +430,7 @@ while [[ $# -gt 0 ]]; do
         --debug) DEBUG=true; shift ;;
         --non-interactive) NONINTERACTIVE=true; shift ;;
         --skip-docker-install) SKIP_DOCKER_INSTALL=true; shift ;;
+        --skip-nginx) SKIP_NGINX=true; shift ;;
         --env-file) CLI_ENV_FILE="$2"; shift 2 ;;
         --port) CLI_PORT="$2"; shift 2 ;;
         --external-url) CLI_EXTERNAL_URL="$2"; shift 2 ;;
@@ -390,6 +443,14 @@ done
 
 [ "$ACTION" == "help" ] && { usage; exit 0; }
 [ -n "$CLI_ENV_FILE" ] && CONFIG_FILE="$CLI_ENV_FILE"
+
+if $SKIP_NGINX; then
+    if [ "$CLI_SSL_MODE" == "managed" ]; then
+        echo "Error: --skip-nginx and --ssl-mode managed conflict - managed SSL needs nginx/certbot." >&2
+        exit 1
+    fi
+    CLI_SSL_MODE="external"
+fi
 
 $DEBUG && set -x
 ensure_installed "deploy-local.sh" curl jq
@@ -846,7 +907,7 @@ step_build_and_start() {
         export APP_IMAGE
         log "Using image $APP_IMAGE (skipping local build)"
     else
-        compose build app
+        compose build app || { echo "Error: image build failed (see output above) - fix the Dockerfile/build context and retry." >&2; exit 1; }
     fi
 
     if ! compose up -d; then
@@ -898,7 +959,10 @@ step_ssl_cert() {
         EXTERNAL_DOMAIN="$domain" PORT="$PORT" HTTPS_PORT="${HTTPS_PORT:-443}" \
             envsubst '${EXTERNAL_DOMAIN} ${PORT} ${HTTPS_PORT}' \
             < "$SCRIPT_DIR/nginx/nginx-https.conf.example" > "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf"
-        compose exec nginx nginx -s reload
+        if ! compose exec nginx nginx -s reload; then
+            log "Warning: certificate issued, but nginx failed to reload it. Reload manually:"
+            log "  docker compose --env-file $CONFIG_FILE -f $SCRIPT_DIR/docker-compose.yml --profile ssl exec nginx nginx -s reload"
+        fi
         state_mark_done "ssl_cert"
         log "Certificate issued - $EXTERNAL_URL is now served over HTTPS."
         return 0
@@ -1090,24 +1154,27 @@ confirm_existing_config() {
 
     echo
     log "Found an existing $(basename "$CONFIG_FILE") - here's what's configured:"
-    echo "  PORT=${PORT:-}"
-    echo "  EXTERNAL_URL=${EXTERNAL_URL:-}"
-    echo "  APP_IMAGE=${APP_IMAGE:-(build locally from Dockerfile)}"
-    echo "  SSL_MODE=${SSL_MODE:-}"
-    if [ "${SSL_MODE:-}" == "managed" ]; then
-        echo "  HTTP_PORT=${HTTP_PORT:-80}"
-        echo "  HTTPS_PORT=${HTTPS_PORT:-443}"
-    fi
-    echo "  CLIENT_NAME=${CLIENT_NAME:-}"
-    echo "  CLIENT_ID=${CLIENT_ID:-}"
-    echo "  CLIENT_SECRET=$([ -n "${CLIENT_SECRET:-}" ] && echo '(set)' || echo '(blank)')"
-    echo "  API_KEY=$([ -n "${API_KEY:-}" ] && echo '(set)' || echo '(blank)')"
-    echo "  SIGNING_KEY=$([ -n "${SIGNING_KEY:-}" ] && echo '(set)' || echo '(blank, will be generated)')"
-    if [ "${CLIENT_NAME:-}" == "metropolis" ]; then
-        echo "  YELLOW_AI_API_KEY=$([ -n "${YELLOW_AI_API_KEY:-}" ] && echo '(set)' || echo '(blank, optional)')"
-        echo "  JAPI_KEY=$([ -n "${JAPI_KEY:-}" ] && echo '(set)' || echo '(blank, optional)')"
-        echo "  JAPI_AUTHORIZATION=$([ -n "${JAPI_AUTHORIZATION:-}" ] && echo '(set)' || echo '(blank, optional)')"
-    fi
+    # Reads whatever's actually in the file rather than a hardcoded field
+    # list, so any field added to config.env(.example) later shows up here
+    # automatically with zero code changes. Masks by name pattern (SECRET/
+    # KEY/TOKEN/PASSWORD/AUTH) instead of a hardcoded per-field mask list,
+    # for the same reason - a future secret-like field gets masked too as
+    # long as it's named consistently with the existing ones.
+    local line key value display
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ "$line" == *"="* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [ -z "$value" ]; then
+            display="(blank)"
+        elif [[ "$key" =~ (SECRET|KEY|TOKEN|PASSWORD|AUTH) ]]; then
+            display="(set)"
+        else
+            display="$value"
+        fi
+        echo "  $key=$display"
+    done < "$CONFIG_FILE"
     echo
 
     local confirm
@@ -1130,6 +1197,7 @@ cmd_install() {
     local config_pre_existed=false
     [ -f "$CONFIG_FILE" ] && config_pre_existed=true
 
+    apply_skip_nginx
     verify_setup
     $config_pre_existed && confirm_existing_config
     state_init
@@ -1147,6 +1215,7 @@ cmd_install() {
 }
 
 cmd_upgrade() {
+    apply_skip_nginx
     verify_setup
     state_init
     [ -n "$CLI_IMAGE" ] && APP_IMAGE="$CLI_IMAGE"
@@ -1155,9 +1224,13 @@ cmd_upgrade() {
         set_env_var "$CONFIG_FILE" APP_IMAGE "$APP_IMAGE"
         log "Using image $APP_IMAGE"
     else
-        compose build app
+        compose build app || { echo "Error: image build failed (see output above) - fix the Dockerfile/build context and retry. The previous container, if any, is untouched." >&2; exit 1; }
     fi
-    compose up -d
+    if ! compose up -d; then
+        echo "Error: upgrade failed to start the new container (see output above)." >&2
+        echo "Not tearing anything down automatically - check 'docker compose ... ps' for current state, then fix the issue and retry." >&2
+        exit 1
+    fi
     step_health_check
     log "Upgrade complete."
 }
@@ -1169,7 +1242,7 @@ cmd_stop() {
     if ! $NONINTERACTIVE; then
         confirm "This stops and removes eka-webhook containers (volumes/certs/network are kept). Continue?" || { echo "Aborted."; exit 0; }
     fi
-    compose down
+    compose down || { echo "Error: 'docker compose down' failed (see output above)." >&2; exit 1; }
     echo "Containers stopped and removed. Config, volumes, certs, and the eka-net network were left in place."
     echo "Bring it back up with: $0 install   (or) $0 upgrade"
 }
@@ -1179,7 +1252,7 @@ cmd_uninstall() {
     if ! $NONINTERACTIVE; then
         confirm "This stops and removes eka-webhook containers and named volumes. Continue?" || { echo "Aborted."; exit 0; }
     fi
-    compose down -v
+    compose down -v || { echo "Error: 'docker compose down -v' failed (see output above)." >&2; exit 1; }
     if ! $NONINTERACTIVE; then
         if confirm "Also remove the docker network 'eka-net'?"; then
             docker network rm eka-net 2>/dev/null || true
