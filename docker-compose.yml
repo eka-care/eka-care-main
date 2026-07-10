@@ -30,55 +30,55 @@ services:
         max-file: "5"
 
   # eka-nginx-block:start (see --skip-nginx in deploy-local.sh - toggling
-  # that flag comments/uncomments everything between these two markers)
-  # Only started when the "ssl" profile is active (SSL_MODE=managed).
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: eka-webhook-nginx
-    profiles: ["ssl"]
-    restart: unless-stopped
-    depends_on:
-      - app
-    ports:
-      - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
-      - "${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
-    volumes:
-      # Overwrites the image's own conf.d/default.conf so there's exactly one
-      # server block handling port 80/443 - no ambiguity with nginx's stock
-      # welcome-page config if a request's Host header doesn't match ours.
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/ssl-enabled:/etc/nginx/ssl-enabled:ro
-      - certbot_webroot:/var/www/certbot:ro
-      - certbot_certs:/etc/letsencrypt:ro
-    networks:
-      - eka-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-  # Long-running renewal loop. Initial issuance is a one-off `docker compose
-  # --profile ssl run --rm certbot certonly ...` invoked by deploy-local.sh
-  # during the SSL bootstrap step, after nginx is already serving the ACME
-  # HTTP-01 challenge on port 80.
-  certbot:
-    image: certbot/certbot:latest
-    container_name: eka-webhook-certbot
-    profiles: ["ssl"]
-    restart: unless-stopped
-    volumes:
-      - certbot_webroot:/var/www/certbot
-      - certbot_certs:/etc/letsencrypt
-    networks:
-      - eka-net
-    entrypoint: >
-      sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+#EKA-SKIP-NGINX#   # that flag comments/uncomments everything between these two markers)
+#EKA-SKIP-NGINX#   # Only started when the "ssl" profile is active (SSL_MODE=managed).
+#EKA-SKIP-NGINX#   nginx:
+#EKA-SKIP-NGINX#     image: nginx:1.27-alpine
+#EKA-SKIP-NGINX#     container_name: eka-webhook-nginx
+#EKA-SKIP-NGINX#     profiles: ["ssl"]
+#EKA-SKIP-NGINX#     restart: unless-stopped
+#EKA-SKIP-NGINX#     depends_on:
+#EKA-SKIP-NGINX#       - eka-webhook-app
+#EKA-SKIP-NGINX#     ports:
+#EKA-SKIP-NGINX#       - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
+#EKA-SKIP-NGINX#       - "${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
+#EKA-SKIP-NGINX#     volumes:
+#EKA-SKIP-NGINX#       # Overwrites the image's own conf.d/default.conf so there's exactly one
+#EKA-SKIP-NGINX#       # server block handling port 80/443 - no ambiguity with nginx's stock
+#EKA-SKIP-NGINX#       # welcome-page config if a request's Host header doesn't match ours.
+#EKA-SKIP-NGINX#       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+#EKA-SKIP-NGINX#       - ./nginx/ssl-enabled:/etc/nginx/ssl-enabled:ro
+#EKA-SKIP-NGINX#       - certbot_webroot:/var/www/certbot:ro
+#EKA-SKIP-NGINX#       - certbot_certs:/etc/letsencrypt:ro
+#EKA-SKIP-NGINX#     networks:
+#EKA-SKIP-NGINX#       - eka-net
+#EKA-SKIP-NGINX#     logging:
+#EKA-SKIP-NGINX#       driver: json-file
+#EKA-SKIP-NGINX#       options:
+#EKA-SKIP-NGINX#         max-size: "10m"
+#EKA-SKIP-NGINX#         max-file: "5"
+#EKA-SKIP-NGINX# 
+#EKA-SKIP-NGINX#   # Long-running renewal loop. Initial issuance is a one-off `docker compose
+#EKA-SKIP-NGINX#   # --profile ssl run --rm certbot certonly ...` invoked by deploy-local.sh
+#EKA-SKIP-NGINX#   # during the SSL bootstrap step, after nginx is already serving the ACME
+#EKA-SKIP-NGINX#   # HTTP-01 challenge on port 80.
+#EKA-SKIP-NGINX#   certbot:
+#EKA-SKIP-NGINX#     image: certbot/certbot:latest
+#EKA-SKIP-NGINX#     container_name: eka-webhook-certbot
+#EKA-SKIP-NGINX#     profiles: ["ssl"]
+#EKA-SKIP-NGINX#     restart: unless-stopped
+#EKA-SKIP-NGINX#     volumes:
+#EKA-SKIP-NGINX#       - certbot_webroot:/var/www/certbot
+#EKA-SKIP-NGINX#       - certbot_certs:/etc/letsencrypt
+#EKA-SKIP-NGINX#     networks:
+#EKA-SKIP-NGINX#       - eka-net
+#EKA-SKIP-NGINX#     entrypoint: >
+#EKA-SKIP-NGINX#       sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
+#EKA-SKIP-NGINX#     logging:
+#EKA-SKIP-NGINX#       driver: json-file
+#EKA-SKIP-NGINX#       options:
+#EKA-SKIP-NGINX#         max-size: "10m"
+#EKA-SKIP-NGINX#         max-file: "5"
   # eka-nginx-block:end
 
 volumes:

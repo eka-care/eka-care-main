@@ -50,16 +50,17 @@ CONFIG_CONFIRMED=false
 FIELDS_TO_CHANGE=""
 # Set true when the user declines "use as-is" in confirm_existing_config()
 # (whether or not they then named specific fields). Steps that collect
-# config VALUES (ssl_setup, generate_env, config_validate, build_and_start,
-# health_check, webhook_register) bypass their normal step_done()
-# already-done skip when this is set, so ask() actually gets a chance to
-# re-prompt and the new values actually get applied to the running
+# config VALUES (preflight, ssl_setup, generate_env, config_validate,
+# build_and_start, health_check, webhook_register) bypass their normal
+# step_done() already-done skip when this is set, so ask() actually gets a
+# chance to re-prompt and the new values actually get applied to the running
 # container - otherwise a prior successful install's step_done markers would
 # make the whole "which fields do you want to change" flow a no-op.
-# Deliberately does NOT bypass step_preflight (its port-in-use check would
-# false-positive against this app's own already-bound port) or
-# step_docker_install/step_network_create (no config values live there, no
-# need to redo sudo work).
+# step_preflight's PORT conflict check only fires when PORT is actually
+# changing (see old_port in step_preflight), so re-running it doesn't
+# false-positive against this app's own already-bound port. Deliberately
+# does NOT bypass step_docker_install/step_network_create (no config values
+# live there, no need to redo sudo work).
 RECONFIGURE=false
 # Space-separated, UPPERCASE list of every field name ask() (or the
 # hand-rolled SIGNING_KEY prompt) actually evaluated against FIELDS_TO_CHANGE
@@ -127,11 +128,13 @@ Options:
   --debug                   Verbose output (set -x, no curl silencing)
   --non-interactive         Never prompt; fail if a required value is missing
   --skip-docker-install     Assume Docker/compose are already installed
-  --skip-nginx              Comment out nginx/certbot in docker-compose.yml
-                              entirely and force --ssl-mode external (no
-                              managed SSL, no DNS/cert requirement at all).
-                              Reversible: omit the flag on a later run and
-                              the block is automatically uncommented again.
+  --skip-nginx              Force --ssl-mode external (no managed SSL, no
+                              DNS/cert requirement at all). Note: nginx/certbot
+                              are commented out of docker-compose.yml by
+                              default anyway whenever SSL_MODE isn't managed -
+                              this flag just forces that outcome regardless of
+                              config.env/prompts. Reversible: SSL_MODE=managed
+                              on a later run automatically uncomments it again.
   --env-file PATH            Path to the env file (default: config.env,
                               materialized from config.env.example if missing)
   --docker-compose-file PATH Path to the compose file (default: docker-compose.yml
@@ -413,40 +416,48 @@ persist_rootless_docker_env() {
     fi
 }
 
-# Idempotently comments out (--skip-nginx) or restores (no --skip-nginx) the
-# nginx/certbot service block in docker-compose.yml, between the
-# eka-nginx-block sentinel comments. Marks lines it comments with a unique
-# prefix so uncommenting is exact and reversible - lines that were already
-# plain comments inside the block (e.g. explanatory ones) are untouched
-# either way. Safe to call on every install/upgrade run: a run without the
-# flag always restores the block, so nothing is left in a stale state from
-# a previous --skip-nginx run.
+# Idempotently comments out or restores the nginx/certbot service block in
+# docker-compose.yml, between the eka-nginx-block sentinel comments. Commented
+# out by default: the block is only left uncommented when SSL_MODE actually
+# resolves to "managed" (via --ssl-mode/config.env/interactive prompt) -
+# --skip-nginx forces this too, since it forces SSL_MODE=external, but isn't
+# required just to get the default commented-out state. Marks lines it
+# comments with a unique prefix so uncommenting is exact and reversible -
+# lines that were already plain comments inside the block (e.g. explanatory
+# ones) are untouched either way. Safe to call multiple times per run (called
+# from verify_setup once SSL_MODE is first known, and again from
+# step_ssl_setup if the interactive prompt changes it) and across
+# install/upgrade runs - whichever way SSL_MODE resolves, the file always
+# ends up matching it, so nothing is left in a stale state.
 NGINX_BLOCK_SKIP_MARKER="#EKA-SKIP-NGINX# "
 apply_skip_nginx() {
     local compose_file="$COMPOSE_FILE"
+    local skip=true
+    { $SKIP_NGINX || [ "${SSL_MODE:-external}" != "managed" ]; } || skip=false
+
     local start_line end_line
     start_line=$(grep -n '^[[:space:]]*# eka-nginx-block:start' "$compose_file" | head -1 | cut -d: -f1)
     end_line=$(grep -n '^[[:space:]]*# eka-nginx-block:end' "$compose_file" | head -1 | cut -d: -f1)
     if [ -z "$start_line" ] || [ -z "$end_line" ] || [ "$start_line" -ge "$end_line" ]; then
-        log "Warning: couldn't find the eka-nginx-block markers in $(basename "$compose_file") (has it been edited manually?) - skipping the --skip-nginx toggle and using the file as-is."
-        if $SKIP_NGINX; then
-            log "Note: --skip-nginx was requested but not applied to $(basename "$compose_file") itself. SSL_MODE is still forced to 'external', so nginx/certbot won't be started regardless - but the compose file's own nginx/certbot definitions are untouched."
+        log "Warning: couldn't find the eka-nginx-block markers in $(basename "$compose_file") (has it been edited manually?) - skipping the nginx/certbot toggle and using the file as-is."
+        if $skip; then
+            log "Note: nginx/certbot weren't commented out in $(basename "$compose_file") itself as a result. SSL_MODE=managed isn't in effect, so nginx/certbot won't be started regardless - but the compose file's own nginx/certbot definitions are untouched."
         fi
         return 0
     fi
 
     if $DRY_RUN; then
-        if $SKIP_NGINX; then
-            echo "[dry-run] would comment out the nginx/certbot block in $(basename "$compose_file")"
+        if $skip; then
+            echo "[dry-run] would comment out the nginx/certbot block in $(basename "$compose_file") (SSL_MODE != managed)"
         else
-            echo "[dry-run] would ensure the nginx/certbot block in $(basename "$compose_file") is uncommented"
+            echo "[dry-run] would ensure the nginx/certbot block in $(basename "$compose_file") is uncommented (SSL_MODE=managed)"
         fi
         return 0
     fi
 
     local tmp
     tmp=$(mktemp)
-    awk -v s="$start_line" -v e="$end_line" -v skip="$SKIP_NGINX" -v marker="$NGINX_BLOCK_SKIP_MARKER" '
+    awk -v s="$start_line" -v e="$end_line" -v skip="$skip" -v marker="$NGINX_BLOCK_SKIP_MARKER" '
         NR > s && NR < e {
             if (skip == "true") {
                 if (index($0, marker) != 1) { print marker $0; next }
@@ -651,10 +662,29 @@ compose() {
     docker compose "${args[@]}" --env-file "$CONFIG_FILE" "$@"
 }
 
+# The app service's name in the compose file is user-editable (docker-compose.yml
+# is a tracked file people rename services in), so don't hardcode it - ask
+# compose itself which service isn't nginx/certbot. Resolved once and cached
+# per run; falls back to "app" if compose can't be asked yet (e.g. --dry-run
+# before Docker/config.env exist), matching this repo's original service name.
+APP_SERVICE=""
+app_service_name() {
+    if [ -n "$APP_SERVICE" ]; then
+        echo "$APP_SERVICE"
+        return 0
+    fi
+    local services
+    if services=$(compose config --services 2>/dev/null); then
+        APP_SERVICE=$(echo "$services" | grep -vE '^(nginx|certbot)$' | head -1)
+    fi
+    [ -z "$APP_SERVICE" ] && APP_SERVICE="app"
+    echo "$APP_SERVICE"
+}
+
 # ---- steps ------------------------------------------------------------------
 
 step_preflight() {
-    if step_done "preflight" && ! $FRESH; then log "preflight: already done, skipping"; return; fi
+    if step_done "preflight" && ! $FRESH && ! $RECONFIGURE; then log "preflight: already done, skipping"; return; fi
     log "Checking system requirements..."
 
     if [ "$(uname -s)" != "Linux" ]; then
@@ -671,10 +701,15 @@ step_preflight() {
     [ "$mem_gb" -lt 1 ] && log "Warning: less than 1GB RAM detected."
     [ "$disk_avail_gb" -lt 2 ] && log "Warning: less than 2GB free disk detected."
 
+    local old_port="${PORT:-}"
     [ -n "$CLI_PORT" ] && PORT="$CLI_PORT"
-    ask "Port to expose the webhook service on" PORT "${PORT:-8080}" false true
+    ask "Port to expose the webhook service on" PORT "${PORT:-8080}" false true true
     set_env_var "$CONFIG_FILE" PORT "$PORT"
-    if ! $DRY_RUN && command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -q ":${PORT}\$"; then
+    # Only check for a conflict when PORT is actually changing (or this is a
+    # genuinely fresh install, old_port empty) - otherwise this app's own
+    # already-running container is legitimately bound to $PORT, and the
+    # check would false-positive against itself on every reconfigure/re-run.
+    if [ "$PORT" != "$old_port" ] && ! $DRY_RUN && command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -q ":${PORT}\$"; then
         echo "Error: port $PORT is already in use on this host." >&2
         exit 1
     fi
@@ -951,18 +986,41 @@ step_config_validate() {
 }
 
 step_build_and_start() {
-    if step_done "build_and_start" && ! $FRESH && ! $RECONFIGURE; then log "build_and_start: already done, skipping"; return; fi
+    # Deliberately no step_done skip here (unlike every other step): the
+    # Dockerfile/docker-compose.yml build context can change between runs of
+    # a plain 'install' (e.g. editing a service name, the Dockerfile itself),
+    # and Docker's own layer cache already makes re-running 'compose build'
+    # a fast no-op when nothing actually changed - so there's no idempotency
+    # cost to just always rebuilding/restarting on every install, matching
+    # how 'upgrade' already behaves unconditionally.
+    #
+    # Recorded *before* attempting anything below: whether this deployment
+    # was already up and running going into this run. Since this step no
+    # longer skips on a re-run, a transient 'compose up -d' failure could
+    # otherwise trigger the teardown-on-failure path below against an
+    # already-healthy deployment - which 'upgrade' deliberately never does
+    # for the same reason. Only the genuinely-first install (nothing running
+    # yet to protect) gets the auto-teardown-and-exit behavior; a failed
+    # re-run of an already-working deployment just errors out untouched,
+    # same as 'upgrade'.
+    local was_already_up=false
+    step_done "build_and_start" && was_already_up=true
 
     if [ -n "${APP_IMAGE:-}" ]; then
         export APP_IMAGE
         log "Using image $APP_IMAGE (skipping local build)"
     else
-        compose build app || { echo "Error: image build failed (see output above) - fix the Dockerfile/build context and retry." >&2; exit 1; }
+        compose build "$(app_service_name)" || { echo "Error: image build failed (see output above) - fix the Dockerfile/build context and retry." >&2; exit 1; }
     fi
 
-    if ! compose up -d; then
+    if ! compose up -d --remove-orphans; then
+        if $was_already_up; then
+            echo "Error: failed to (re)start the container (see output above)." >&2
+            echo "Not tearing anything down automatically - the previous deployment, if still running, is left as-is. Check 'docker compose ... ps', fix the issue, then re-run install." >&2
+            exit 1
+        fi
         echo "Start failed, reverting (docker compose down)..." >&2
-        compose down || true
+        compose down --remove-orphans || true
         exit 1
     fi
 
@@ -1023,7 +1081,7 @@ step_ssl_cert() {
         log "Continuing over plain HTTP (--non-interactive: not prompting). Re-run 'install' once DNS is fixed to retry."
     elif ! confirm "Continue running the app over plain HTTP for now (fix DNS and retry SSL later)?"; then
         echo "Aborting: fix DNS for $domain, then re-run 'install' to retry." >&2
-        compose down || true
+        compose down --remove-orphans || true
         exit 1
     fi
     echo
@@ -1108,7 +1166,7 @@ step_finalize() {
     echo "  Config file:  $CONFIG_FILE"
     local profile_flag=""
     [ "$SSL_MODE" == "managed" ] && profile_flag="--profile ssl "
-    echo "  View logs:    $0 status   (or) docker compose --env-file $CONFIG_FILE -f $COMPOSE_FILE ${profile_flag}logs -f app"
+    echo "  View logs:    $0 status   (or) docker compose --env-file $CONFIG_FILE -f $COMPOSE_FILE ${profile_flag}logs -f $(app_service_name)"
     echo "  Upgrade:      $0 upgrade [--image <ref>]"
     echo "  Uninstall:    $0 uninstall"
 }
@@ -1156,6 +1214,15 @@ verify_setup() {
     done
 
     load_config_file
+    # Resolve SSL_MODE as early as possible (CLI flag > existing config.env
+    # value > "external" default) so apply_skip_nginx can decide whether
+    # nginx/certbot should be commented out in docker-compose.yml *before*
+    # anything validates or builds against it. step_ssl_setup may still
+    # change SSL_MODE later via an interactive prompt (cmd_install only) -
+    # it calls apply_skip_nginx again itself to catch up if so.
+    SSL_MODE="${CLI_SSL_MODE:-${SSL_MODE:-external}}"
+    apply_skip_nginx
+
     if [ -f "$CONFIG_FILE" ]; then
         log "  OK       $(basename "$CONFIG_FILE")"
     elif $DRY_RUN && [ -f "${CONFIG_FILE}.example" ]; then
@@ -1173,7 +1240,6 @@ verify_setup() {
     if [ ! -f "$CONFIG_FILE" ]; then
         log "  (dry-run) compose config validation skipped - $(basename "$CONFIG_FILE") doesn't exist yet"
     elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-        SSL_MODE="${CLI_SSL_MODE:-${SSL_MODE:-external}}"
         local err_log
         err_log=$(mktemp)
         if compose config -q 2>"$err_log"; then
@@ -1250,7 +1316,6 @@ cmd_install() {
     local config_pre_existed=false
     [ -f "$CONFIG_FILE" ] && config_pre_existed=true
 
-    apply_skip_nginx
     verify_setup
     $config_pre_existed && confirm_existing_config
     state_init
@@ -1258,6 +1323,7 @@ cmd_install() {
     step_docker_install
     step_network_create
     step_ssl_setup
+    apply_skip_nginx
     step_generate_env
     warn_unmatched_fields_to_change
     step_config_validate
@@ -1269,7 +1335,6 @@ cmd_install() {
 }
 
 cmd_upgrade() {
-    apply_skip_nginx
     verify_setup
     state_init
     [ -n "$CLI_IMAGE" ] && APP_IMAGE="$CLI_IMAGE"
@@ -1278,9 +1343,9 @@ cmd_upgrade() {
         set_env_var "$CONFIG_FILE" APP_IMAGE "$APP_IMAGE"
         log "Using image $APP_IMAGE"
     else
-        compose build app || { echo "Error: image build failed (see output above) - fix the Dockerfile/build context and retry. The previous container, if any, is untouched." >&2; exit 1; }
+        compose build "$(app_service_name)" || { echo "Error: image build failed (see output above) - fix the Dockerfile/build context and retry. The previous container, if any, is untouched." >&2; exit 1; }
     fi
-    if ! compose up -d; then
+    if ! compose up -d --remove-orphans; then
         echo "Error: upgrade failed to start the new container (see output above)." >&2
         echo "Not tearing anything down automatically - check 'docker compose ... ps' for current state, then fix the issue and retry." >&2
         exit 1
@@ -1296,7 +1361,7 @@ cmd_stop() {
     if ! $NONINTERACTIVE; then
         confirm "This stops and removes eka-webhook containers (volumes/certs/network are kept). Continue?" || { echo "Aborted."; exit 0; }
     fi
-    compose down || { echo "Error: 'docker compose down' failed (see output above)." >&2; exit 1; }
+    compose down --remove-orphans || { echo "Error: 'docker compose down' failed (see output above)." >&2; exit 1; }
     echo "Containers stopped and removed. Config, volumes, certs, and the eka-net network were left in place."
     echo "Bring it back up with: $0 install   (or) $0 upgrade"
 }
@@ -1306,7 +1371,7 @@ cmd_uninstall() {
     if ! $NONINTERACTIVE; then
         confirm "This stops and removes eka-webhook containers and named volumes. Continue?" || { echo "Aborted."; exit 0; }
     fi
-    compose down -v || { echo "Error: 'docker compose down -v' failed (see output above)." >&2; exit 1; }
+    compose down -v --remove-orphans || { echo "Error: 'docker compose down -v' failed (see output above)." >&2; exit 1; }
     if ! $NONINTERACTIVE; then
         if confirm "Also remove the docker network 'eka-net'?"; then
             docker network rm eka-net 2>/dev/null || true
