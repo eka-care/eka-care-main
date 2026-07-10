@@ -48,6 +48,19 @@ CONFIG_CONFIRMED=false
 # file as-is but also didn't want to walk every field one by one. Empty
 # means "no specific list" - normal per-field behavior applies.
 FIELDS_TO_CHANGE=""
+# Set true when the user declines "use as-is" in confirm_existing_config()
+# (whether or not they then named specific fields). Steps that collect
+# config VALUES (ssl_setup, generate_env, config_validate, build_and_start,
+# health_check, webhook_register) bypass their normal step_done()
+# already-done skip when this is set, so ask() actually gets a chance to
+# re-prompt and the new values actually get applied to the running
+# container - otherwise a prior successful install's step_done markers would
+# make the whole "which fields do you want to change" flow a no-op.
+# Deliberately does NOT bypass step_preflight (its port-in-use check would
+# false-positive against this app's own already-bound port) or
+# step_docker_install/step_network_create (no config values live there, no
+# need to redo sudo work).
+RECONFIGURE=false
 
 field_should_prompt() {
     case " $FIELDS_TO_CHANGE " in
@@ -782,7 +795,7 @@ step_network_create() {
 }
 
 step_ssl_setup() {
-    if step_done "ssl_setup" && ! $FRESH; then log "ssl_setup: already done, skipping"; return; fi
+    if step_done "ssl_setup" && ! $FRESH && ! $RECONFIGURE; then log "ssl_setup: already done, skipping"; return; fi
 
     [ -n "$CLI_EXTERNAL_URL" ] && EXTERNAL_URL="$CLI_EXTERNAL_URL"
     ask "External URL clients will reach this service on (e.g. https://webhook.example.com)" EXTERNAL_URL "" false true
@@ -822,7 +835,7 @@ step_ssl_setup() {
 }
 
 step_generate_env() {
-    if step_done "generate_env" && ! $FRESH; then log "generate_env: already done, skipping"; return; fi
+    if step_done "generate_env" && ! $FRESH && ! $RECONFIGURE; then log "generate_env: already done, skipping"; return; fi
 
     [ -n "$CLI_IMAGE" ] && APP_IMAGE="$CLI_IMAGE"
     ask "Pre-built image to run, e.g. ekacare/ekapython-webhook-sdk:v1.2.3 (leave blank to build from the local Dockerfile)" APP_IMAGE "" false false
@@ -895,7 +908,7 @@ step_generate_env() {
 }
 
 step_config_validate() {
-    if step_done "config_validate" && ! $FRESH; then log "config_validate: already done, skipping"; return; fi
+    if step_done "config_validate" && ! $FRESH && ! $RECONFIGURE; then log "config_validate: already done, skipping"; return; fi
     log "Validating rendered compose configuration..."
     if $DRY_RUN && ! command -v docker >/dev/null 2>&1; then
         echo "[dry-run] docker isn't installed yet - skipping live 'compose config' validation"
@@ -907,7 +920,7 @@ step_config_validate() {
 }
 
 step_build_and_start() {
-    if step_done "build_and_start" && ! $FRESH; then log "build_and_start: already done, skipping"; return; fi
+    if step_done "build_and_start" && ! $FRESH && ! $RECONFIGURE; then log "build_and_start: already done, skipping"; return; fi
 
     if [ -n "${APP_IMAGE:-}" ]; then
         export APP_IMAGE
@@ -988,7 +1001,7 @@ step_ssl_cert() {
 }
 
 step_health_check() {
-    if step_done "health_check" && ! $FRESH; then log "health_check: already done, skipping"; return; fi
+    if step_done "health_check" && ! $FRESH && ! $RECONFIGURE; then log "health_check: already done, skipping"; return; fi
     if $DRY_RUN; then
         echo "[dry-run] would poll http://127.0.0.1:${PORT}/ for readiness"
         state_mark_done "health_check"
@@ -1022,7 +1035,7 @@ step_health_check() {
 }
 
 step_webhook_register() {
-    if step_done "webhook_register" && ! $FRESH; then log "webhook_register: already done, skipping"; return; fi
+    if step_done "webhook_register" && ! $FRESH && ! $RECONFIGURE; then log "webhook_register: already done, skipping"; return; fi
     if $DRY_RUN; then
         echo "[dry-run] would call register_webhook() (POST to api.eka.care)"
         state_mark_done "webhook_register"
@@ -1191,11 +1204,14 @@ confirm_existing_config() {
         return
     fi
 
+    RECONFIGURE=true
     local fields
     read -r -p "Which field(s) do you want to change? (space/comma-separated names, e.g. CLIENT_SECRET API_KEY - leave blank to review every field one by one): " fields
     if [ -n "$fields" ]; then
         FIELDS_TO_CHANGE=$(echo "$fields" | tr ',' ' ' | tr '[:lower:]' '[:upper:]')
         log "Only re-prompting for: $FIELDS_TO_CHANGE - everything else keeps its value from $(basename "$CONFIG_FILE")."
+    else
+        log "Reviewing every field - Enter keeps the existing value, or type a new one."
     fi
 }
 
