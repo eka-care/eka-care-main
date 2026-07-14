@@ -1,0 +1,47 @@
+# Applies to both Dockerfile (standalone/local) and Dockerfile-aws (Lambda) -
+# keeps the build context (and layer cache) free of anything the running app
+# doesn't need.
+
+.git
+.gitignore
+.dockerignore
+
+# Docs
+README.md
+docs/
+
+# Deployment tooling - not needed inside the app image
+deploy-aws.sh
+deploy-local.sh
+lib/
+eka-webhook-cf-template.yaml
+parameters.json
+response.txt
+
+# Secrets / local config - must never be baked into an image
+config-aws.env
+config-aws.env.example
+config.env
+config.env.example
+.env
+
+# Local/VM stack files - only consumed by docker compose on the host, not the app
+docker-compose*.yml
+nginx/
+Dockerfile
+Dockerfile-aws
+
+# Tests
+tests/
+
+# Python artifacts
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Editor/OS cruft
+.idea/
+.DS_Store

@@ -1,18 +1,23 @@
-FROM public.ecr.aws/lambda/python:3.10
+FROM python:3.10-slim
 
-COPY app.py ${LAMBDA_TASK_ROOT}
-COPY ./requirements.txt ${LAMBDA_TASK_ROOT}
-COPY ./webhook_consumer.py ${LAMBDA_TASK_ROOT}
-COPY ./constants.py ${LAMBDA_TASK_ROOT}
-COPY ./utils.py ${LAMBDA_TASK_ROOT}
-COPY ./message_integration.py ${LAMBDA_TASK_ROOT}
-COPY ./template_configs.py ${LAMBDA_TASK_ROOT}
-COPY ./config_loader.py ${LAMBDA_TASK_ROOT}
-COPY ./config.yaml ${LAMBDA_TASK_ROOT}
-COPY ./metropolis ${LAMBDA_TASK_ROOT}/metropolis
-COPY ./miracles ${LAMBDA_TASK_ROOT}/miracles
+ARG CLIENT_NAME
 
-# Install the Python dependencies
+WORKDIR /app
+
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["app.generic_handler"]
+COPY app.py ./
+COPY webhook_consumer.py ./
+COPY constants.py ./
+COPY utils.py ./
+COPY message_integration.py ./
+COPY template_configs.py ./
+COPY config_loader.py ./
+COPY config.yaml ./
+COPY ${CLIENT_NAME} ./${CLIENT_NAME}
+
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["python", "app.py"]

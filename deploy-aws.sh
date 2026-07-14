@@ -3,14 +3,14 @@
 set -e
 
 # Default config file location
-CONFIG_FILE="config.env"
+CONFIG_FILE="config-aws.env"
 
 # Disable AWS CLI pager to prevent prompts
 export AWS_PAGER=""
 
 # Function to display usage
 usage() {
-    echo "Usage: $0 [deploy|upgrade|delete|register-webhook] [--version VERSION]"
+    echo "Usage: $0 [deploy|upgrade|delete|register-webhook] [--version VERSION] [--env-file PATH]"
     echo "Deploy, upgrade, delete CloudFormation stack, or register webhook for the Eka webhook"
     echo ""
     echo "  deploy                    Deploy the CloudFormation stack (default)"
@@ -18,6 +18,8 @@ usage() {
     echo "  delete                    Delete the CloudFormation stack"
     echo "  register-webhook          Register the webhook with Eka API (without deployment)"
     echo "  --version VERSION         Specify Docker image version"
+    echo "  --env-file PATH           Path to the env file (default: config-aws.env, materialized"
+    echo "                            from config-aws.env.example if missing)"
     echo "  -h, --help                Display this help message"
     echo ""
 }
@@ -64,6 +66,15 @@ while [[ $# -gt 0 ]]; do
             echo "Using Docker image version from command line: $CMD_DOCKER_IMAGE_VERSION"
             shift 2
             ;;
+        --env-file)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: --env-file requires a value"
+                usage
+                exit 1
+            fi
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -76,25 +87,51 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Load environment variables from config file
-if [ -f "$CONFIG_FILE" ]; then
-    echo "Loading configuration from $CONFIG_FILE..."
-    source "$CONFIG_FILE"
-else
-    echo "Error: Config file '$CONFIG_FILE' not found!"
-    echo "Please create a config.env file with the required configuration parameters."
-    echo "Example:"
-    echo "STACK_NAME=eka-webhook-stack"
-    echo "TEMPLATE_FILE=eka-webhook-cf-template.yaml"
-    echo "REGION=ap-south-1"
-    echo "STAGE_NAME=prod"
-    echo "EXTERNAL_URL=https://eka-webhook.example.com"
-    echo "CERTIFICATE_ARN=arn:aws:acm:ap-south-1:123456789012:certificate/abcd1234-5678-90ef-ghij-klmnopqrstuv"
-    echo "VPC_ID=vpc-12345678"
-    echo "SUBNET_IDS=subnet-12345678,subnet-87654321"
-    echo "SECURITY_GROUP_ID=sg-12345678 # Optional - will be created if not specified"
+# Load environment variables from config file, materializing it from the
+# tracked example template on first run.
+if [ ! -f "$CONFIG_FILE" ]; then
+    if [ -f "${CONFIG_FILE}.example" ]; then
+        cp "${CONFIG_FILE}.example" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        echo "Created $CONFIG_FILE from ${CONFIG_FILE}.example - edit it with your real values, then re-run this command."
+        exit 1
+    else
+        echo "Error: Config file '$CONFIG_FILE' not found and no ${CONFIG_FILE}.example to create it from!"
+        exit 1
+    fi
+fi
+
+echo "Loading configuration from $CONFIG_FILE..."
+source "$CONFIG_FILE"
+
+# Verify the files this script depends on are present before doing anything
+# else - fails fast with a clear message instead of partway through a deploy.
+echo "Verifying deployment files..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MISSING_FILES=0
+for REQUIRED_FILE in "$TEMPLATE_FILE" "$SCRIPT_DIR/Dockerfile-aws" "$SCRIPT_DIR/lib/register-webhook.sh" "$SCRIPT_DIR/lib/connectivity.sh"; do
+    if [ -f "$REQUIRED_FILE" ]; then
+        echo "  OK       $REQUIRED_FILE"
+    else
+        echo "  MISSING  $REQUIRED_FILE"
+        MISSING_FILES=1
+    fi
+done
+if [ "$MISSING_FILES" -eq 1 ]; then
+    echo "Error: this checkout is missing files this script depends on - re-clone/restore the repo before continuing." >&2
     exit 1
 fi
+source "$SCRIPT_DIR/lib/register-webhook.sh"
+source "$SCRIPT_DIR/lib/connectivity.sh"
+
+# Required config values must not be blank (the .example ships sane defaults,
+# but a client could clear one by hand).
+for REQUIRED_VAR in STACK_NAME TEMPLATE_FILE REGION; do
+    if [[ -z "${!REQUIRED_VAR}" ]]; then
+        echo "Error: $REQUIRED_VAR must be set in $CONFIG_FILE" >&2
+        exit 1
+    fi
+done
 
 # Use command line version if provided, otherwise use config file version
 if [[ -n "$CMD_DOCKER_IMAGE_VERSION" ]]; then
@@ -119,8 +156,11 @@ API_GW_NAME="${STACK_NAME}"
 # Use stack name as the ECR repository name
 ECR_REPO_NAME="${STACK_NAME}"
 
-# Check if AWS CLI is installed
-if ! command -v aws &> /dev/null; then
+echo "Verifying prerequisites for action '$ACTION'..."
+
+# AWS CLI isn't needed to just register a webhook (that's plain curl to
+# api.eka.care) - every other action deploys/updates/deletes AWS resources.
+if [[ "$ACTION" != "register-webhook" ]] && ! command -v aws &> /dev/null; then
     echo "Error: AWS CLI is not installed. Please install it first."
     exit 1
 fi
@@ -131,19 +171,64 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# Get AWS account ID if not specified
-if [[ -z "$AWS_ACCOUNT_ID" ]]; then
-    echo "AWS_ACCOUNT_ID not specified in config, retrieving from AWS..."
-    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    if [[ $? -ne 0 || -z "$AWS_ACCOUNT_ID" ]]; then
-        echo "Error: Failed to retrieve AWS account ID. Please ensure you're authenticated with AWS CLI."
-        exit 1
-    fi
-    echo "Using AWS Account ID: $AWS_ACCOUNT_ID"
+# curl is needed by register_webhook (lib/register-webhook.sh), which every
+# action except 'delete' can end up calling.
+if [[ "$ACTION" != "delete" ]] && ! command -v curl &> /dev/null; then
+    echo "Error: curl is not installed. Please install it first."
+    exit 1
 fi
 
-# Set ECR repository URL 
+# Docker is only needed to build/push the Lambda image.
+if [[ "$ACTION" == "deploy" || "$ACTION" == "upgrade" ]]; then
+    if ! command -v docker &> /dev/null; then
+        echo "Error: Docker is not installed. Please install it first."
+        exit 1
+    fi
+    if ! docker info &> /dev/null; then
+        echo "Error: Docker is installed but the daemon isn't reachable. Is it running, and do you have permission to use it (docker group / sudo)?"
+        exit 1
+    fi
+fi
+
+# Verify AWS CLI is actually authenticated before doing anything - every
+# action but 'register-webhook' needs a working AWS session, and failing
+# here (instead of deep inside an ECR login or CloudFormation call) means
+# nothing has touched AWS yet.
+if [[ "$ACTION" != "register-webhook" ]]; then
+    echo "Verifying AWS credentials..."
+    STS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || true
+    if [[ -z "$STS_ACCOUNT_ID" ]]; then
+        echo "Error: Failed to authenticate with AWS CLI. Run 'aws configure' / 'aws sso login' and re-run this command." >&2
+        exit 1
+    fi
+    if [[ -n "$AWS_ACCOUNT_ID" && "$AWS_ACCOUNT_ID" != "$STS_ACCOUNT_ID" ]]; then
+        echo "Warning: AWS_ACCOUNT_ID in $CONFIG_FILE ($AWS_ACCOUNT_ID) does not match the currently authenticated account ($STS_ACCOUNT_ID)." >&2
+        echo "Warning: proceeding with the configured AWS_ACCOUNT_ID - double check this is the intended account/profile." >&2
+    elif [[ -z "$AWS_ACCOUNT_ID" ]]; then
+        AWS_ACCOUNT_ID="$STS_ACCOUNT_ID"
+    fi
+    echo "Authenticated as AWS Account ID: $STS_ACCOUNT_ID"
+fi
+
+# Set ECR repository URL
 ECR_REPO_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:${DOCKER_IMAGE_VERSION}"
+
+# Outbound connectivity preflight - client networks commonly block one or
+# more of these; report every blocked endpoint together (with the exact
+# reason) instead of dying deep inside a build/push/API call.
+CONN_FAILED=0
+if [[ "$ACTION" == "deploy" || "$ACTION" == "upgrade" ]]; then
+    check_connectivity "public.ecr.aws" 443 "AWS public ECR (Lambda base image)" || CONN_FAILED=1
+    check_connectivity "${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com" 443 "Your ECR repository" || CONN_FAILED=1
+fi
+if [[ "$ACTION" == "deploy" || "$ACTION" == "register-webhook" ]]; then
+    check_connectivity "api.eka.care" 443 "Eka Care API (webhook registration)" || CONN_FAILED=1
+fi
+if [[ "$CONN_FAILED" -eq 1 ]]; then
+    echo "Error: one or more required endpoints are unreachable (see FAIL lines above)." >&2
+    echo "Ask your network/security team to allow outbound HTTPS to them, then re-run this command." >&2
+    exit 1
+fi
 
 # Function to set up ECR and deploy Docker image
 setup_ecr_and_deploy_image() {
@@ -167,7 +252,7 @@ setup_ecr_and_deploy_image() {
     
     # Build the Docker image from local code
     echo "Building Docker image with version tag $DOCKER_IMAGE_VERSION..."
-    docker build -t ekapython-webhook-sdk:$DOCKER_IMAGE_VERSION . || {
+    docker build -f Dockerfile-aws -t ekapython-webhook-sdk:$DOCKER_IMAGE_VERSION . || {
         echo "Error: Failed to build Docker image. Exiting."
         # Clean up ECR repository if we created it in this run
         if $ECR_REPO_CREATED; then
@@ -201,18 +286,24 @@ setup_ecr_and_deploy_image() {
     echo "Docker image successfully pushed to ECR."
 }
 
-# Extract domain name from EXTERNAL_URL
-if [[ -n "$EXTERNAL_URL" ]]; then
+# Extract domain name from EXTERNAL_URL - only deploy/upgrade need this
+# (they call generate_parameters, which requires HOSTED_ZONE_ID); doing it
+# unconditionally forced 'register-webhook' and 'delete' to depend on AWS/
+# Route53 access they never actually use.
+if [[ ( "$ACTION" == "deploy" || "$ACTION" == "upgrade" ) && -n "$EXTERNAL_URL" ]]; then
     DOMAIN_NAME=$(echo "$EXTERNAL_URL" | sed -E 's|^https?://||' | sed -E 's|/.*$||')
     echo "Extracted domain name: $DOMAIN_NAME"
-    
+
     # Try to find the hosted zone ID for the domain
     if [[ -z "$HOSTED_ZONE_ID" ]]; then
         echo "Looking up hosted zone ID for domain $DOMAIN_NAME..."
-        
+
         # Get all hosted zones
-        ZONES_JSON=$(aws route53 list-hosted-zones --output json)
-        
+        ZONES_JSON=$(aws route53 list-hosted-zones --output json) || {
+            echo "Error: Failed to list Route53 hosted zones. Check AWS permissions/connectivity." >&2
+            exit 1
+        }
+
         # Find the most specific matching zone for the domain
         LONGEST_MATCH=""
         MATCHED_ZONE_ID=""
@@ -344,12 +435,6 @@ EOF
     echo "Parameters file generated successfully at $PARAMS_FILE"
 }
 
-# Check if template file exists
-if [ ! -f "$TEMPLATE_FILE" ]; then
-    echo "Error: Template file '$TEMPLATE_FILE' not found!"
-    exit 1
-fi
-
 # Function to deploy stack - will now run after ECR operations
 deploy_stack() {
     # Generate parameters from environment variables
@@ -451,7 +536,7 @@ upgrade_lambda() {
     
     # Validate Docker image version is provided
     if [ -z "$DOCKER_IMAGE_VERSION" ]; then
-        echo "Error: DOCKER_IMAGE_VERSION must be specified via --version parameter or in config.env"
+        echo "Error: DOCKER_IMAGE_VERSION must be specified via --version parameter or in config-aws.env"
         exit 1
     fi
     
@@ -460,7 +545,7 @@ upgrade_lambda() {
     # Set up ECR and deploy the new image
     setup_ecr_and_deploy_image
     
-    # Generate parameters file from config.env, just like in deploy_stack
+    # Generate parameters file from config-aws.env, just like in deploy_stack
     generate_parameters
     
     # Update the CloudFormation stack with the new parameters
@@ -489,70 +574,6 @@ upgrade_lambda() {
     get_stack_outputs
 }
 
-register_webhook(){
-    # Register the webhook with the specified URL
-    echo "Getting Auth Token"
-
-    # Check if required variables are set
-    if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$API_KEY" ]; then
-        echo "Error: CLIENT_ID, CLIENT_SECRET, and API_KEY must be set in config.env"
-        return 1
-    fi
-
-    if [ -z "$SIGNING_KEY" ]; then
-        echo "Error: SIGNING_KEY must be set in config.env"
-        return 1
-    fi
-
-    AUTH_TOKEN=$(curl --request POST \
-        --url 'https://api.eka.care/connect-auth/v1/account/login' \
-        --header 'Content-Type: application/json' \
-        --data "{
-        \"client_id\": \"${CLIENT_ID}\",
-        \"client_secret\": \"${CLIENT_SECRET}\",
-        \"api_key\": \"${API_KEY}\"
-        }" | jq -r '.access_token')
-
-    if [ -z "$AUTH_TOKEN" ] || [ "$AUTH_TOKEN" == "null" ]; then
-        echo "Error: Failed to obtain auth token. Check your CLIENT_ID, CLIENT_SECRET, and API_KEY."
-        return 1
-    fi
-
-    echo "Registering webhook with URL: $EXTERNAL_URL"
-
-    # Store HTTP status code and response body separately
-    HTTP_STATUS=$(curl --silent --output response.txt --write-out "%{http_code}" \
-        --request POST \
-        --url https://api.eka.care/notification/v1/connect/webhook/subscriptions \
-        --header "Authorization: Bearer ${AUTH_TOKEN}" \
-        --header 'Content-Type: application/json' \
-        --data "{
-        \"event_names\": [
-            \"appointment.created\",
-            \"appointment.updated\",
-            \"prescription.created\",
-            \"prescription.updated\"
-        ],
-        \"endpoint\": \"${EXTERNAL_URL}\",
-        \"signing_key\": \"${SIGNING_KEY}\",
-        \"protocol\": \"https\"
-        }")
-    
-    RESPONSE_BODY=$(cat response.txt)
-    rm -f response.txt  # Clean up temporary file
-    
-    # Check the HTTP status code
-    if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then
-        echo "Webhook registered successfully! (HTTP $HTTP_STATUS)"
-        echo "Response: $RESPONSE_BODY"
-        return 0
-    else
-        echo "Failed to register webhook. HTTP Status: $HTTP_STATUS"
-        echo "Response: $RESPONSE_BODY"
-        return 1
-    fi
-}
-
 # Execute the specified action based on the ACTION variable
 case $ACTION in
     deploy)
@@ -573,7 +594,7 @@ case $ACTION in
         # Only register the webhook with Eka API
         echo "Registering webhook only..."
         if [ -z "$EXTERNAL_URL" ]; then
-            echo "Error: EXTERNAL_URL must be set in config.env"
+            echo "Error: EXTERNAL_URL must be set in config-aws.env"
             exit 1
         fi
         register_webhook

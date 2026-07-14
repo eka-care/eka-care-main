@@ -1,0 +1,21 @@
+# Rendered by deploy-local.sh (envsubst) into
+# ./nginx/ssl-enabled/nginx-https.conf ONLY after certbot has successfully
+# issued a certificate. Picked up by the
+# `include /etc/nginx/ssl-enabled/*.conf;` line in nginx.conf, followed by
+# an `nginx -s reload` inside the nginx container.
+
+server {
+    listen ${HTTPS_PORT} ssl default_server;
+    server_name ${EXTERNAL_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${EXTERNAL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${EXTERNAL_DOMAIN}/privkey.pem;
+
+    location / {
+        proxy_pass http://app:${PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
