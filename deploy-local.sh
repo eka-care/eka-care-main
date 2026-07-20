@@ -37,6 +37,7 @@ DEBUG=false
 NONINTERACTIVE=false
 SKIP_DOCKER_INSTALL=false
 SKIP_NGINX=false
+SKIP_WEBHOOK_REGISTER=false
 # Set true once the user confirms an existing config.env is fine as-is
 # (see confirm_existing_config()) - suppresses ask()'s per-field "existing:
 # ..., Enter to keep" walkthrough for already-set values, WITHOUT touching
@@ -132,6 +133,9 @@ Options:
                               managed SSL, no DNS/cert requirement at all).
                               Reversible: omit the flag on a later run and
                               the block is automatically uncommented again.
+  --skip-webhook-register   Don't register the webhook with Eka Care during
+                              install (deploy the container only). Register
+                              later with: $0 register-webhook
   --env-file PATH            Path to the env file (default: config.env,
                               materialized from config.env.example if missing)
   --docker-compose-file PATH Path to the compose file (default: docker-compose.yml
@@ -477,6 +481,7 @@ while [[ $# -gt 0 ]]; do
         --non-interactive) NONINTERACTIVE=true; shift ;;
         --skip-docker-install) SKIP_DOCKER_INSTALL=true; shift ;;
         --skip-nginx) SKIP_NGINX=true; shift ;;
+        --skip-webhook-register) SKIP_WEBHOOK_REGISTER=true; shift ;;
         --env-file) CLI_ENV_FILE="$2"; shift 2 ;;
         --docker-compose-file) CLI_COMPOSE_FILE="$2"; shift 2 ;;
         --port) CLI_PORT="$2"; shift 2 ;;
@@ -682,7 +687,12 @@ step_preflight() {
     log "Checking outbound connectivity (client firewalls commonly block some of these)..."
     local conn_failed=0
     check_connectivity "www.eka.care" 443 "Eka Care" || conn_failed=1
-    check_connectivity "api.eka.care" 443 "Eka Care API (webhook registration)" || conn_failed=1
+    # api.eka.care is only used to register the webhook - skip pre-checking it
+    # when registration is being skipped, so an install that never talks to it
+    # isn't blocked by it being unreachable.
+    if ! $SKIP_WEBHOOK_REGISTER; then
+        check_connectivity "api.eka.care" 443 "Eka Care API (webhook registration)" || conn_failed=1
+    fi
 
     local registry_host
     registry_host=$(parse_registry_host "${CLI_IMAGE:-registry-1.docker.io/library/python}")
@@ -1066,6 +1076,10 @@ step_health_check() {
 }
 
 step_webhook_register() {
+    if $SKIP_WEBHOOK_REGISTER; then
+        log "Skipping webhook registration (--skip-webhook-register). Register later with: $0 register-webhook"
+        return
+    fi
     if step_done "webhook_register" && ! $FRESH && ! $RECONFIGURE; then log "webhook_register: already done, skipping"; return; fi
     if $DRY_RUN; then
         echo "[dry-run] would call register_webhook() (POST to api.eka.care)"
