@@ -877,7 +877,7 @@ def apply_skip_nginx(state):
 # publicly reachable). `config` always runs for real (read-only).
 # If a sibling stack already runs a 'shared-network' (e.g. connect-eternalhealth,
 # whose front nginx proxies /communication/webhook/ to us), join THAT so its
-# nginx can reach us over Docker DNS at http://webhook-app:80. Otherwise fall
+# nginx can reach us over Docker DNS at http://eka-webhook-app:80. Otherwise fall
 # back to our own 'eka-net', which the installer creates. Resolved once, and
 # only cached once docker is actually available (so a pre-install probe when
 # docker isn't installed yet doesn't lock in the fallback).
@@ -1206,7 +1206,7 @@ def step_build_and_start(state):
         os.environ["APP_IMAGE"] = app_image
         log(f"Using image {app_image} (skipping local build)")
     else:
-        if compose(state, ["build", "webhook-app"], check=False).returncode != 0:
+        if compose(state, ["build", "eka-webhook-app"], check=False).returncode != 0:
             die("image build failed (see output above) - fix the Dockerfile/build context and retry.")
 
     if compose(state, ["up", "-d"], check=False).returncode != 0:
@@ -1422,7 +1422,7 @@ def step_finalize(state):
     print(f"  Config file:  {state.config_file}")
     profile_flag = "--profile ssl " if state.ssl_mode == "managed" else ""
     print(f"  View logs:    {PROG} status   (or) docker compose --env-file {state.config_file} "
-          f"-f {state.compose_file} {profile_flag}logs -f webhook-app")
+          f"-f {state.compose_file} {profile_flag}logs -f eka-webhook-app")
     print(f"  Upgrade:      {PROG} upgrade [--image <ref>]")
     print(f"  Uninstall:    {PROG} uninstall")
 
@@ -1580,11 +1580,11 @@ def cmd_upgrade(state):
         log(f"Using image {app_image}")
     else:
         ensure_buildx_plugin(state)
-        if compose(state, ["build", "webhook-app"], check=False).returncode != 0:
+        if compose(state, ["build", "eka-webhook-app"], check=False).returncode != 0:
             die("image build failed (see output above) - fix the Dockerfile/build context and retry. The "
                 "previous container, if any, is untouched.")
     # Only the app service - not the whole stack - so nginx/certbot stay up.
-    if compose(state, ["up", "-d", "webhook-app"], check=False).returncode != 0:
+    if compose(state, ["up", "-d", "eka-webhook-app"], check=False).returncode != 0:
         print("Error: upgrade failed to start the new container (see output above).", file=sys.stderr)
         print("Not tearing anything down automatically - check 'docker compose ... ps' for current state, "
               "then fix the issue and retry.", file=sys.stderr)

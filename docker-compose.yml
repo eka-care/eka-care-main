@@ -8,7 +8,7 @@
 #     (SSL_MODE=managed) so the app is never reachable except through nginx.
 
 services:
-  webhook-app:
+  eka-webhook-app:
     build:
       context: .
       dockerfile: Dockerfile
@@ -23,7 +23,7 @@ services:
       # The app always listens on :80 INSIDE the container (overrides the
       # PORT in config.env, which is the host-published port below). This is
       # the shared-network convention - a front nginx (this repo's own, or a
-      # sibling stack's) proxies to http://webhook-app:80 over Docker DNS.
+      # sibling stack's) proxies to http://eka-webhook-app:80 over Docker DNS.
       - PORT=80
     ports:
       # host-published PORT -> container :80. Left in place even behind a
@@ -46,7 +46,7 @@ services:
     profiles: ["ssl"]
     restart: unless-stopped
     depends_on:
-      - webhook-app
+      - eka-webhook-app
     ports:
       - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
       - "${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
