@@ -65,6 +65,11 @@ PROG = "./deploy-local.sh"
 
 NGINX_BLOCK_SKIP_MARKER = "#EKA-SKIP-NGINX# "
 
+# "docker compose build" shells out to buildx; an old/missing one breaks the
+# image build even when the compose plugin itself is fine.
+BUILDX_MIN = (0, 17, 0)
+BUILDX_FALLBACK_TAG = "v0.19.3"  # any pin >= BUILDX_MIN works if the GitHub API is unreachable
+
 USAGE = f"""Usage: {PROG} [install|upgrade|stop|uninstall|status|register-webhook|help] [options]
 
   install                   Run the interactive installer (default)
@@ -144,6 +149,7 @@ class State:
         self.compose_file = DEFAULT_COMPOSE_FILE
         self.ssl_mode = ""
         self.external_url = ""
+        self.app_network = None  # resolved lazily: "shared-network" or "eka-net"
         self.values = {}  # current contents of config_file
 
 
@@ -668,6 +674,74 @@ def ensure_compose_plugin(state):
                 "(for tooling/scripts expecting the old binary name).")
 
 
+def buildx_version():
+    """(major, minor, patch) of the active docker buildx, or None if absent/unparseable."""
+    r = subprocess.run(["docker", "buildx", "version"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    # Older buildx prints "... 0.12.1 <sha>", newer "... v0.35.0 <sha>" - v optional.
+    m = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)\b", r.stdout)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def latest_github_tag(repo):
+    """Best-effort latest release tag via the GitHub API. None on any failure."""
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "eka-webhook-deploy"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode()).get("tag_name")
+    except Exception:
+        return None
+
+
+def ensure_buildx_plugin(state):
+    # "docker compose build" shells out to buildx; an old/missing one breaks the
+    # image build even when the compose plugin itself is fine. A user who relies
+    # on an old system buildx (or none) gets a recent one in their own
+    # cli-plugins dir (which takes precedence).
+    ver = buildx_version()
+    if ver is not None and ver >= BUILDX_MIN:
+        return
+    dotted = lambda v: ".".join(map(str, v))
+    if ver is None:
+        log("Docker buildx plugin not found ('docker buildx' unavailable).")
+    else:
+        log(f"Docker buildx {dotted(ver)} is too old - 'docker compose build' needs "
+            f">= {dotted(BUILDX_MIN)}.")
+    if not state.non_interactive:
+        if not confirm(state, "Download a current buildx now (to ~/.docker/cli-plugins/docker-buildx)?"):
+            die(f"a recent Docker buildx (>= {dotted(BUILDX_MIN)}) is required to build the image.")
+
+    arch = platform.machine()
+    # buildx release assets use amd64/arm64 (NOT compose's x86_64/aarch64).
+    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    if arch not in arch_map:
+        die(f"no known buildx build for architecture '{arch}'. Install it manually: "
+            "https://github.com/docker/buildx/releases")
+    tag = latest_github_tag("docker/buildx") or BUILDX_FALLBACK_TAG
+    buildx_url = ("https://github.com/docker/buildx/releases/download/"
+                  f"{tag}/buildx-{tag}.linux-{arch_map[arch]}")
+
+    if state.dry_run:
+        print(f"[dry-run] would download {buildx_url} to ~/.docker/cli-plugins/docker-buildx")
+        return
+    plugin_dir = Path.home() / ".docker" / "cli-plugins"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    plugin_path = plugin_dir / "docker-buildx"
+    try:
+        urllib.request.urlretrieve(buildx_url, plugin_path)
+    except urllib.error.URLError as e:
+        die(f"failed to download buildx from {buildx_url}: {e}")
+    plugin_path.chmod(0o755)
+    ver2 = buildx_version()
+    if ver2 is None or ver2 < BUILDX_MIN:
+        die(f"buildx installed but 'docker buildx version' still reports < {dotted(BUILDX_MIN)} "
+            f"(got {dotted(ver2) if ver2 else 'none'}).")
+    log(f"Installed docker buildx {tag}.")
+
+
 def persist_rootless_docker_env(state):
     rc_file = Path.home() / ".bashrc"
     marker = "# Added by eka-webhook deploy-local.sh (rootless Docker)"
@@ -801,9 +875,29 @@ def apply_skip_nginx(state):
 # profile (nginx + certbot) only when SSL_MODE=managed, and pins the app's
 # published bind address to 127.0.0.1 in that case (only nginx should be
 # publicly reachable). `config` always runs for real (read-only).
+# If a sibling stack already runs a 'shared-network' (e.g. connect-eternalhealth,
+# whose front nginx proxies /communication/webhook/ to us), join THAT so its
+# nginx can reach us over Docker DNS at http://webhook-app:80. Otherwise fall
+# back to our own 'eka-net', which the installer creates. Resolved once, and
+# only cached once docker is actually available (so a pre-install probe when
+# docker isn't installed yet doesn't lock in the fallback).
+def resolve_app_network(state):
+    if state.app_network is not None:
+        return state.app_network
+    if not which("docker"):
+        return "eka-net"
+    if subprocess.run(["docker", "network", "inspect", "shared-network"],
+                      capture_output=True).returncode == 0:
+        state.app_network = "shared-network"
+    else:
+        state.app_network = "eka-net"
+    return state.app_network
+
+
 def compose(state, args, check=True, capture=False):
     cmd = ["docker", "compose", "-f", str(state.compose_file)]
     env = os.environ.copy()
+    env["APP_NETWORK"] = resolve_app_network(state)
     if state.ssl_mode == "managed":
         cmd += ["--profile", "ssl"]
         env["APP_BIND_ADDR"] = "127.0.0.1"
@@ -961,6 +1055,7 @@ def step_docker_install(state):
             persist_rootless_docker_env(state)
 
     ensure_compose_plugin(state)
+    ensure_buildx_plugin(state)
     state_mark_done(state, "docker_install")
 
 
@@ -968,7 +1063,11 @@ def step_network_create(state):
     if step_done("network_create") and not state.fresh:
         log("network_create: already done, skipping")
         return
-    if state.dry_run:
+    net = resolve_app_network(state)
+    if net == "shared-network":
+        log("Detected an existing 'shared-network' - joining it instead of creating 'eka-net' "
+            "(a sibling stack's front nginx lives there and will proxy to this webhook).")
+    elif state.dry_run:
         print("[dry-run] would run: docker network create eka-net (if missing)")
     else:
         if subprocess.run(["docker", "network", "inspect", "eka-net"], capture_output=True).returncode != 0:
@@ -1497,7 +1596,8 @@ def cmd_stop(state):
             return
     if compose(state, ["down"], check=False).returncode != 0:
         die("'docker compose down' failed (see output above).")
-    print("Containers stopped and removed. Config, volumes, certs, and the eka-net network were left in place.")
+    print(f"Containers stopped and removed. Config, volumes, certs, and the {resolve_app_network(state)} "
+          "network were left in place.")
     print(f"Bring it back up with: {PROG} install   (or) {PROG} upgrade")
 
 
@@ -1510,7 +1610,9 @@ def cmd_uninstall(state):
             return
     if compose(state, ["down", "-v"], check=False).returncode != 0:
         die("'docker compose down -v' failed (see output above).")
-    if not state.non_interactive:
+    # Only ever offer to remove our OWN eka-net. A shared-network belongs to a
+    # sibling stack (other live services attach to it) - never touch it here.
+    if not state.non_interactive and resolve_app_network(state) == "eka-net":
         if confirm(state, "Also remove the docker network 'eka-net'?"):
             subprocess.run(["docker", "network", "rm", "eka-net"], capture_output=True)
     print(f"Note: {state.config_file} and {STATE_FILE} were left in place (they hold secrets/history) - "

@@ -17,7 +17,7 @@ COPY config_loader.py ./
 COPY config.yaml ./
 COPY ${CLIENT_NAME} ./${CLIENT_NAME}
 
-ENV PORT=8080
-EXPOSE 8080
+ENV PORT=80
+EXPOSE 80
 
 CMD ["python", "app.py"]

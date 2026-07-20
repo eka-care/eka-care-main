@@ -19,10 +19,18 @@ services:
     restart: unless-stopped
     env_file:
       - config.env
+    environment:
+      # The app always listens on :80 INSIDE the container (overrides the
+      # PORT in config.env, which is the host-published port below). This is
+      # the shared-network convention - a front nginx (this repo's own, or a
+      # sibling stack's) proxies to http://webhook-app:80 over Docker DNS.
+      - PORT=80
     ports:
-      - "${APP_BIND_ADDR:-0.0.0.0}:${PORT:-8080}:${PORT:-8080}"
+      # host-published PORT -> container :80. Left in place even behind a
+      # front nginx so the installer's local health check can reach it.
+      - "${APP_BIND_ADDR:-0.0.0.0}:${PORT:-8080}:80"
     networks:
-      - eka-net
+      - appnet
     logging:
       driver: json-file
       options:
@@ -51,7 +59,7 @@ services:
       - certbot_webroot:/var/www/certbot:ro
       - certbot_certs:/etc/letsencrypt:ro
     networks:
-      - eka-net
+      - appnet
     logging:
       driver: json-file
       options:
@@ -71,7 +79,7 @@ services:
       - certbot_webroot:/var/www/certbot
       - certbot_certs:/etc/letsencrypt
     networks:
-      - eka-net
+      - appnet
     entrypoint: >
       sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
     logging:
@@ -86,5 +94,10 @@ volumes:
   certbot_certs:
 
 networks:
-  eka-net:
+  # Which external docker network the containers join. deploy-local.sh sets
+  # APP_NETWORK=shared-network when a sibling stack's 'shared-network' exists
+  # (so its front nginx can reach us), else falls back to 'eka-net' which the
+  # installer creates. Always external - the installer owns creation.
+  appnet:
     external: true
+    name: ${APP_NETWORK:-eka-net}
