@@ -150,6 +150,7 @@ class State:
         self.ssl_mode = ""
         self.external_url = ""
         self.app_network = None  # resolved lazily: "shared-network" or "eka-net"
+        self.redeployed = False  # the app container was (re)created this run -> re-run health check
         self.values = {}  # current contents of config_file
 
 
@@ -1196,10 +1197,27 @@ def step_config_validate(state):
     state_mark_done(state, "config_validate")
 
 
+def app_container_running(state):
+    """True only if the eka-webhook-app container exists AND is running. Guards
+    against a stale 'done' step marker whose container was since removed -
+    without this, a plain re-install skips the deploy and reports success while
+    nothing actually runs."""
+    if state.dry_run:
+        return True
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", "eka-webhook-app"],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
 def step_build_and_start(state):
-    if step_done("build_and_start") and not state.fresh and not state.reconfigure:
+    already = step_done("build_and_start") and not state.fresh and not state.reconfigure
+    if already and app_container_running(state):
         log("build_and_start: already done, skipping")
         return
+    if already:
+        log("build_and_start: marked done previously, but the eka-webhook-app container isn't "
+            "running - redeploying.")
+    state.redeployed = True
 
     app_image = state.values.get("APP_IMAGE", "")
     if app_image:
@@ -1286,7 +1304,7 @@ def _app_healthy(port):
 
 
 def step_health_check(state):
-    if step_done("health_check") and not state.fresh and not state.reconfigure:
+    if step_done("health_check") and not state.fresh and not state.reconfigure and not state.redeployed:
         log("health_check: already done, skipping")
         return
     port = state.values.get("PORT", "8080")
@@ -1589,6 +1607,7 @@ def cmd_upgrade(state):
         print("Not tearing anything down automatically - check 'docker compose ... ps' for current state, "
               "then fix the issue and retry.", file=sys.stderr)
         sys.exit(1)
+    state.redeployed = True
     step_health_check(state)
     log("Upgrade complete. If a front nginx proxies to this app, reload it so it re-resolves the "
         "recreated container (e.g. docker exec eka-webhook-nginx nginx -s reload).")
