@@ -1563,7 +1563,12 @@ def cmd_install(state):
 
 
 def cmd_upgrade(state):
-    apply_skip_nginx(state)
+    # Deliberately does NOT touch nginx/certbot: upgrade only rebuilds and
+    # recreates the app container. A front nginx (this repo's own, or a sibling
+    # stack's) keeps running - reload it afterwards if it proxies to us, since
+    # the recreated app may get a new IP (see the hint printed at the end).
+    # Also does NOT run apply_skip_nginx() - upgrade never re-toggles the
+    # compose nginx block.
     verify_setup(state)
     state_init(state)
     if state.cli_image:
@@ -1574,16 +1579,19 @@ def cmd_upgrade(state):
         set_env_var(state, "APP_IMAGE", app_image)
         log(f"Using image {app_image}")
     else:
+        ensure_buildx_plugin(state)
         if compose(state, ["build", "webhook-app"], check=False).returncode != 0:
             die("image build failed (see output above) - fix the Dockerfile/build context and retry. The "
                 "previous container, if any, is untouched.")
-    if compose(state, ["up", "-d"], check=False).returncode != 0:
+    # Only the app service - not the whole stack - so nginx/certbot stay up.
+    if compose(state, ["up", "-d", "webhook-app"], check=False).returncode != 0:
         print("Error: upgrade failed to start the new container (see output above).", file=sys.stderr)
         print("Not tearing anything down automatically - check 'docker compose ... ps' for current state, "
               "then fix the issue and retry.", file=sys.stderr)
         sys.exit(1)
     step_health_check(state)
-    log("Upgrade complete.")
+    log("Upgrade complete. If a front nginx proxies to this app, reload it so it re-resolves the "
+        "recreated container (e.g. docker exec eka-webhook-nginx nginx -s reload).")
 
 
 def cmd_stop(state):
