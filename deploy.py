@@ -1224,6 +1224,9 @@ def step_build_and_start(state):
         os.environ["APP_IMAGE"] = app_image
         log(f"Using image {app_image} (skipping local build)")
     else:
+        # docker_install (where buildx is normally ensured) may have been
+        # skipped as already-done on a redeploy - guard the build here too.
+        ensure_buildx_plugin(state)
         if compose(state, ["build", "eka-webhook-app"], check=False).returncode != 0:
             die("image build failed (see output above) - fix the Dockerfile/build context and retry.")
 
