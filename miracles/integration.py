@@ -51,7 +51,8 @@ def build_miracles_payload(payload):
             "url": media_info.get("mediaLink"),
             "fileName": media_info.get("filename") or "Prescription.pdf",
         }
-    print(_normalize_mobile_number(payload.get("userDetails", {}).get("number")))
+    mob = _normalize_mobile_number(payload.get("userDetails", {}).get("number"))    
+    print(mob)
     return {
         "message": {
             "channel": "WABA",
@@ -61,7 +62,7 @@ def build_miracles_payload(payload):
                 "mediaTemplate": media_template,
             },
             "recipient": {
-                "to": "919555499208",
+                "to": mob,
                 "recipient_type": "individual",
                 "reference": {
                     "cust_ref": "cust_ref123",

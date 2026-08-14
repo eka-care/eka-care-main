@@ -19,10 +19,17 @@ services:
     restart: unless-stopped
     env_file:
       - config.env
+    # The app always listens on 80 inside the container/docker network,
+    # regardless of PORT (config.env's PORT is only the host-published port
+    # below - other containers on shared-network reach this one at
+    # eka-webhook-app:80, not eka-webhook-app:${PORT}). The `environment:`
+    # override here wins over env_file's PORT, which is host-value.
+    environment:
+      - PORT=80
     ports:
-      - "${APP_BIND_ADDR:-0.0.0.0}:${PORT:-8080}:${PORT:-8080}"
+      - "${APP_BIND_ADDR:-0.0.0.0}:${PORT:-8080}:80"
     networks:
-      - eka-net
+      - shared-network
     logging:
       driver: json-file
       options:
@@ -51,7 +58,7 @@ services:
 #EKA-SKIP-NGINX#       - certbot_webroot:/var/www/certbot:ro
 #EKA-SKIP-NGINX#       - certbot_certs:/etc/letsencrypt:ro
 #EKA-SKIP-NGINX#     networks:
-#EKA-SKIP-NGINX#       - eka-net
+#EKA-SKIP-NGINX#       - shared-network
 #EKA-SKIP-NGINX#     logging:
 #EKA-SKIP-NGINX#       driver: json-file
 #EKA-SKIP-NGINX#       options:
@@ -71,7 +78,7 @@ services:
 #EKA-SKIP-NGINX#       - certbot_webroot:/var/www/certbot
 #EKA-SKIP-NGINX#       - certbot_certs:/etc/letsencrypt
 #EKA-SKIP-NGINX#     networks:
-#EKA-SKIP-NGINX#       - eka-net
+#EKA-SKIP-NGINX#       - shared-network
 #EKA-SKIP-NGINX#     entrypoint: >
 #EKA-SKIP-NGINX#       sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
 #EKA-SKIP-NGINX#     logging:
@@ -86,5 +93,5 @@ volumes:
   certbot_certs:
 
 networks:
-  eka-net:
+  shared-network:
     external: true

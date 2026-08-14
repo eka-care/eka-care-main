@@ -849,13 +849,22 @@ ensure_unprivileged_ports() {
     fi
 }
 
+# shared-network is external infrastructure owned by the other eka stack
+# (miracles-app/miracles-listener/miracles-db/etc all run on it already) -
+# this script doesn't create or own it, only verifies it's there. Re-checked
+# even when step_done says "done" (unlike most steps) because the network
+# can vanish between runs (prune, the other stack being torn down) with no
+# local signal - compose's own "declared as external, but could not be
+# found" error is easy to miss buried in upgrade output otherwise.
 step_network_create() {
-    if step_done "network_create" && ! $FRESH; then log "network_create: already done, skipping"; return; fi
     if $DRY_RUN; then
-        echo "[dry-run] would run: docker network create eka-net (if missing)"
-    else
-        docker network inspect eka-net >/dev/null 2>&1 || docker network create eka-net
+        echo "[dry-run] would verify docker network 'shared-network' exists"
+        return
     fi
+    docker network inspect shared-network >/dev/null 2>&1 || {
+        echo "Error: docker network 'shared-network' not found. It's expected to already exist (owned by the other eka stack running on this host) - start that stack first, or create it manually: docker network create shared-network" >&2
+        exit 1
+    }
     state_mark_done "network_create"
 }
 
@@ -890,8 +899,8 @@ step_ssl_setup() {
             echo "[dry-run] would render nginx/nginx.conf (bootstrap, HTTP-only) for domain $domain"
         else
             mkdir -p "$SCRIPT_DIR/nginx/ssl-enabled"
-            EXTERNAL_DOMAIN="$domain" PORT="$PORT" HTTP_PORT="$HTTP_PORT" \
-                envsubst '${EXTERNAL_DOMAIN} ${PORT} ${HTTP_PORT}' \
+            EXTERNAL_DOMAIN="$domain" HTTP_PORT="$HTTP_PORT" \
+                envsubst '${EXTERNAL_DOMAIN} ${HTTP_PORT}' \
                 < "$SCRIPT_DIR/nginx/nginx.conf.example" > "$SCRIPT_DIR/nginx/nginx.conf"
         fi
     fi
@@ -1064,8 +1073,8 @@ step_ssl_cert() {
 
     if compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot \
         -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --no-eff-email; then
-        EXTERNAL_DOMAIN="$domain" PORT="$PORT" HTTPS_PORT="${HTTPS_PORT:-443}" \
-            envsubst '${EXTERNAL_DOMAIN} ${PORT} ${HTTPS_PORT}' \
+        EXTERNAL_DOMAIN="$domain" HTTPS_PORT="${HTTPS_PORT:-443}" \
+            envsubst '${EXTERNAL_DOMAIN} ${HTTPS_PORT}' \
             < "$SCRIPT_DIR/nginx/nginx-https.conf.example" > "$SCRIPT_DIR/nginx/ssl-enabled/nginx-https.conf"
         if ! compose exec nginx nginx -s reload; then
             log "Warning: certificate issued, but nginx failed to reload it. Reload manually:"
@@ -1337,6 +1346,7 @@ cmd_install() {
 cmd_upgrade() {
     verify_setup
     state_init
+    step_network_create
     [ -n "$CLI_IMAGE" ] && APP_IMAGE="$CLI_IMAGE"
     if [ -n "${APP_IMAGE:-}" ]; then
         export APP_IMAGE
@@ -1355,14 +1365,14 @@ cmd_upgrade() {
 }
 
 # Stops and removes containers only - volumes (certbot_certs/certbot_webroot)
-# and the eka-net network are left untouched, unlike 'uninstall' below.
+# and shared-network are left untouched, unlike 'uninstall' below.
 cmd_stop() {
     load_config_file
     if ! $NONINTERACTIVE; then
         confirm "This stops and removes eka-webhook containers (volumes/certs/network are kept). Continue?" || { echo "Aborted."; exit 0; }
     fi
     compose down --remove-orphans || { echo "Error: 'docker compose down' failed (see output above)." >&2; exit 1; }
-    echo "Containers stopped and removed. Config, volumes, certs, and the eka-net network were left in place."
+    echo "Containers stopped and removed. Config, volumes, and certs were left in place (shared-network is owned by the other eka stack, not this installer)."
     echo "Bring it back up with: $0 install   (or) $0 upgrade"
 }
 
@@ -1372,11 +1382,7 @@ cmd_uninstall() {
         confirm "This stops and removes eka-webhook containers and named volumes. Continue?" || { echo "Aborted."; exit 0; }
     fi
     compose down -v --remove-orphans || { echo "Error: 'docker compose down -v' failed (see output above)." >&2; exit 1; }
-    if ! $NONINTERACTIVE; then
-        if confirm "Also remove the docker network 'eka-net'?"; then
-            docker network rm eka-net 2>/dev/null || true
-        fi
-    fi
+    echo "Note: 'shared-network' was left in place - it's owned by the other eka stack running on this host, not by this installer."
     echo "Note: $CONFIG_FILE and $STATE_FILE were left in place (they hold secrets/history) - remove manually if no longer needed."
 }
 

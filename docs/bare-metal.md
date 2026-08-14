@@ -95,7 +95,7 @@ kernel modules, etc.) are unaffected and still asked normally.
 
 | Variable | Meaning |
 |---|---|
-| `PORT` | Port the app listens on (default `8080`) |
+| `PORT` | Host port the app is published on when `SSL_MODE=external` (default `8080`). The app always listens on `80` inside the container/docker network regardless of this value |
 | `EXTERNAL_URL` | Public URL clients/Eka Care will reach this service on |
 | `APP_IMAGE` | Pre-built image to run, e.g. `ekacare/ekapython-webhook-sdk:v1.2.3` ([available tags](https://hub.docker.com/repository/docker/ekacare/ekapython-webhook-sdk/general)). Leave blank to build from the local Dockerfile instead. Set via prompt on `install`, or `./deploy-local.sh upgrade --image <ref>` (which also persists it here for future runs) |
 | `SSL_MODE` | `managed` (we run nginx+certbot for you) or `external` (you already terminate TLS in front of this host) |
