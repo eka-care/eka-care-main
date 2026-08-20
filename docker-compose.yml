@@ -31,10 +31,7 @@ services:
     networks:
       - shared-network
     logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+      driver: journald
 
   # eka-nginx-block:start (see --skip-nginx in deploy-local.sh - toggling
 #EKA-SKIP-NGINX#   # that flag comments/uncomments everything between these two markers)
@@ -60,11 +57,8 @@ services:
 #EKA-SKIP-NGINX#     networks:
 #EKA-SKIP-NGINX#       - shared-network
 #EKA-SKIP-NGINX#     logging:
-#EKA-SKIP-NGINX#       driver: json-file
-#EKA-SKIP-NGINX#       options:
-#EKA-SKIP-NGINX#         max-size: "10m"
-#EKA-SKIP-NGINX#         max-file: "5"
-#EKA-SKIP-NGINX# 
+#EKA-SKIP-NGINX#       driver: journald
+#EKA-SKIP-NGINX# #EKA-SKIP-NGINX#
 #EKA-SKIP-NGINX#   # Long-running renewal loop. Initial issuance is a one-off `docker compose
 #EKA-SKIP-NGINX#   # --profile ssl run --rm certbot certonly ...` invoked by deploy-local.sh
 #EKA-SKIP-NGINX#   # during the SSL bootstrap step, after nginx is already serving the ACME
@@ -82,10 +76,7 @@ services:
 #EKA-SKIP-NGINX#     entrypoint: >
 #EKA-SKIP-NGINX#       sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
 #EKA-SKIP-NGINX#     logging:
-#EKA-SKIP-NGINX#       driver: json-file
-#EKA-SKIP-NGINX#       options:
-#EKA-SKIP-NGINX#         max-size: "10m"
-#EKA-SKIP-NGINX#         max-file: "5"
+#EKA-SKIP-NGINX#       driver: journald
   # eka-nginx-block:end
 
 volumes:
